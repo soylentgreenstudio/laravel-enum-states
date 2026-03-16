@@ -17,8 +17,10 @@ use SoylentGreenStudio\EnumStates\Exceptions\InvalidTransitionException;
 use SoylentGreenStudio\EnumStates\Models\StateTransition;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
+use BackedEnum;
 use ReflectionEnum;
-use ReflectionEnumBackedCase;
+use RuntimeException;
+use Throwable;
 
 class StateMachineManager
 {
@@ -34,7 +36,7 @@ class StateMachineManager
     /**
      * Detect which fields on a model are state machine fields.
      *
-     * @return array<string, class-string<\BackedEnum>> field => enum class
+     * @return array<string, class-string<BackedEnum>> field => enum class
      */
     public static function detectStateMachineFields(Model $model): array
     {
@@ -86,6 +88,7 @@ class StateMachineManager
     /**
      * Get all transitions for an enum class, indexed by case name.
      *
+     * @param class-string<BackedEnum> $enumClass
      * @return array<string, Transition[]>
      */
     public static function getTransitions(string $enumClass): array
@@ -110,6 +113,8 @@ class StateMachineManager
 
     /**
      * Get the list of final state case names for an enum.
+     *
+     * @param class-string<BackedEnum> $enumClass
      */
     public static function getFinalStates(string $enumClass): array
     {
@@ -130,51 +135,95 @@ class StateMachineManager
     }
 
     /**
+     * Get the initial state for an enum class, or null if none is marked.
+     */
+    /**
+     * @param class-string<BackedEnum> $enumClass
+     */
+    public static function getInitialState(string $enumClass): ?BackedEnum
+    {
+        if (isset(static::$initialStateCache[$enumClass])) {
+            $name = static::$initialStateCache[$enumClass];
+
+            return $enumClass::from((new ReflectionEnum($enumClass))->getCase($name)->getBackingValue());
+        }
+
+        if (array_key_exists($enumClass, static::$initialStateCache)) {
+            return null;
+        }
+
+        $reflection = new ReflectionEnum($enumClass);
+
+        foreach ($reflection->getCases() as $case) {
+            if (! empty($case->getAttributes(InitialState::class))) {
+                static::$initialStateCache[$enumClass] = $case->getName();
+
+                return $enumClass::from($case->getBackingValue());
+            }
+        }
+
+        static::$initialStateCache[$enumClass] = null;
+
+        return null;
+    }
+
+    /**
      * Check if the current state can transition to the target state.
      */
-    public static function canTransition(\BackedEnum $from, \BackedEnum $to, Model $model, array $metadata = []): bool
+    public static function canTransition(BackedEnum $from, BackedEnum $to, Model $model, array $metadata = []): bool
     {
         $enumClass = $from::class;
 
-        // Check if from is a final state
         if (in_array($from->name, static::getFinalStates($enumClass), true)) {
             return false;
         }
 
-        // Find a matching transition
-        $transition = static::findTransition($from, $to);
-
-        if ($transition === null) {
-            return false;
-        }
-
-        // Check guard
-        if ($transition->guard !== null) {
-            /** @var TransitionGuard $guard */
-            $guard = app()->make($transition->guard);
-
-            if (! $guard->allow($model, $metadata)) {
-                return false;
-            }
-        }
-
-        return true;
+        return static::findAllowedTransition($from, $to, $model, $metadata) !== null;
     }
 
     /**
-     * Find the Transition attribute that allows from -> to.
+     * Find all Transition attributes that allow from -> to.
+     *
+     * @return Transition[]
      */
-    protected static function findTransition(\BackedEnum $from, \BackedEnum $to): ?Transition
+    protected static function findTransitions(BackedEnum $from, BackedEnum $to): array
     {
         $enumClass = $from::class;
         $transitions = static::getTransitions($enumClass);
         $caseTransitions = $transitions[$from->name] ?? [];
 
+        $matched = [];
+
         foreach ($caseTransitions as $transition) {
             foreach ($transition->to as $target) {
                 if ($target === $to) {
-                    return $transition;
+                    $matched[] = $transition;
+                    break;
                 }
+            }
+        }
+
+        return $matched;
+    }
+
+    /**
+     * Find the first Transition whose guard (if any) passes.
+     * Returns null if no matching transition exists or all guards block.
+     */
+    protected static function findAllowedTransition(BackedEnum $from, BackedEnum $to, Model $model, array $metadata = []): ?Transition
+    {
+        $transitions = static::findTransitions($from, $to);
+
+        foreach ($transitions as $transition) {
+            if ($transition->guard === null) {
+                return $transition;
+            }
+
+            /** @var TransitionGuard $guard */
+            $guard = app()->make($transition->guard);
+
+            if ($guard->allow($model, $metadata)) {
+                return $transition;
             }
         }
 
@@ -187,73 +236,96 @@ class StateMachineManager
      * @throws FinalStateException
      * @throws InvalidTransitionException
      */
-    public static function transition(Model $model, string $field, \BackedEnum $to, array $metadata = []): void
+    public static function transition(Model $model, string $field, BackedEnum $to, array $metadata = []): void
     {
         $from = $model->{$field};
-        $enumClass = $from::class;
+        $enumClass = $to::class;
 
-        // 1. Check if current state is final
+        if (! ($from instanceof BackedEnum)) {
+            throw new RuntimeException(
+                "Cannot transition field [{$field}] on model [{$model->getMorphClass()}]: current value is not a valid enum state."
+            );
+        }
+
+        // Pre-validate outside transaction for fast feedback
         if (in_array($from->name, static::getFinalStates($enumClass), true)) {
             throw FinalStateException::cannotTransition($from, $field);
         }
 
-        // 2. Find matching transition
-        $transition = static::findTransition($from, $to);
-
-        if ($transition === null) {
+        if (empty(static::findTransitions($from, $to))) {
             throw InvalidTransitionException::notAllowed($from, $to, $field);
         }
 
-        // 3. Check guard
-        if ($transition->guard !== null) {
-            /** @var TransitionGuard $guard */
-            $guard = app()->make($transition->guard);
-
-            if (! $guard->allow($model, $metadata)) {
-                throw InvalidTransitionException::guardBlocked($from, $to, $field, $transition->guard);
-            }
-        }
-
-        // 4. Fire TransitionStarted
+        // Fire TransitionStarted with the in-memory state
         event(new TransitionStarted($model, $field, $from, $to, $metadata));
 
         try {
-            // 5. Wrap in DB transaction
-            DB::transaction(function () use ($model, $field, $from, $to, $transition, $metadata) {
-                // 6. Run before hook
+            /** @var BackedEnum $confirmedFrom */
+            $confirmedFrom = null;
+
+            DB::transaction(function () use ($model, $field, $to, $metadata, $enumClass, &$confirmedFrom) {
+                // 1. Re-read the model with a lock to prevent race conditions
+                $fresh = $model->newQuery()->lockForUpdate()->find($model->getKey());
+
+                if ($fresh === null) {
+                    throw new RuntimeException("Model [{$model->getMorphClass()}:{$model->getKey()}] was deleted during transition.");
+                }
+
+                $confirmedFrom = $fresh->{$field};
+
+                // 2. Validate the locked state
+                if (! ($confirmedFrom instanceof BackedEnum)) {
+                    throw new RuntimeException("Field [{$field}] on model [{$model->getMorphClass()}] is not a valid enum state.");
+                }
+
+                if (in_array($confirmedFrom->name, static::getFinalStates($enumClass), true)) {
+                    throw FinalStateException::cannotTransition($confirmedFrom, $field);
+                }
+
+                if (empty(static::findTransitions($confirmedFrom, $to))) {
+                    throw InvalidTransitionException::notAllowed($confirmedFrom, $to, $field);
+                }
+
+                // 3. Find a transition whose guard passes
+                $transition = static::findAllowedTransition($confirmedFrom, $to, $fresh, $metadata);
+
+                if ($transition === null) {
+                    throw InvalidTransitionException::guardBlocked($confirmedFrom, $to, $field, 'all matching guards');
+                }
+
+                // 4. Run before hook
                 if ($transition->before !== null) {
                     /** @var TransitionHook $hook */
                     $hook = app()->make($transition->before);
-                    $hook->handle($model, $from, $to, $metadata);
+                    $hook->handle($model, $confirmedFrom, $to, $metadata);
                 }
 
-                // 7. Update model
+                // 5. Update model
                 $model->{$field} = $to;
                 $model->save();
 
-                // 8. Write history
+                // 6. Write history
                 StateTransition::create([
                     'model_type' => $model->getMorphClass(),
                     'model_id' => $model->getKey(),
                     'field' => $field,
-                    'from' => $from->value,
+                    'from' => $confirmedFrom->value,
                     'to' => $to->value,
                     'metadata' => ! empty($metadata) ? $metadata : null,
                     'transitioned_at' => now(),
                 ]);
 
-                // 9. Run after hook
+                // 7. Run after hook
                 if ($transition->after !== null) {
                     /** @var TransitionHook $hook */
                     $hook = app()->make($transition->after);
-                    $hook->handle($model, $from, $to, $metadata);
+                    $hook->handle($model, $confirmedFrom, $to, $metadata);
                 }
             });
 
-            // 10. Fire TransitionCompleted
-            event(new TransitionCompleted($model, $field, $from, $to, $metadata));
-        } catch (\Throwable $e) {
-            // 11. Fire TransitionFailed, re-throw
+            // Fire TransitionCompleted with the confirmed from-state
+            event(new TransitionCompleted($model, $field, $confirmedFrom ?? $from, $to, $metadata));
+        } catch (Throwable $e) {
             event(new TransitionFailed($model, $field, $from, $to, $e));
 
             throw $e;

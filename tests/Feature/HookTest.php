@@ -5,11 +5,13 @@ declare(strict_types=1);
 use SoylentGreenStudio\EnumStates\Attributes\InitialState;
 use SoylentGreenStudio\EnumStates\Attributes\Transition;
 use SoylentGreenStudio\EnumStates\Contracts\TransitionHook;
+use SoylentGreenStudio\EnumStates\Events\TransitionFailed;
 use SoylentGreenStudio\EnumStates\Models\StateTransition;
 use SoylentGreenStudio\EnumStates\Tests\Support\Factories\HookedOrderFactory;
 use SoylentGreenStudio\EnumStates\Traits\HasStateMachines;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Event;
 
 // ---- Test-local constructs ----
 
@@ -54,7 +56,7 @@ class ThrowingHook implements TransitionHook
 {
     public function handle(Model $model, mixed $from, mixed $to, array $metadata): void
     {
-        throw new \RuntimeException('Hook failed intentionally');
+        throw new RuntimeException('Hook failed intentionally');
     }
 }
 
@@ -98,7 +100,7 @@ it('rolls back transition when before hook throws', function () {
 
     try {
         $order->transitionTo(HookedStatus::Failed);
-    } catch (\RuntimeException) {
+    } catch (RuntimeException) {
         // expected
     }
 
@@ -107,19 +109,19 @@ it('rolls back transition when before hook throws', function () {
 });
 
 it('fires TransitionFailed event when hook throws', function () {
-    \Illuminate\Support\Facades\Event::fake([
-        \SoylentGreenStudio\EnumStates\Events\TransitionFailed::class,
+    Event::fake([
+        TransitionFailed::class,
     ]);
 
     $order = HookedOrder::factory()->create(['status' => 'pending']);
 
     try {
         $order->transitionTo(HookedStatus::Failed);
-    } catch (\RuntimeException) {
+    } catch (RuntimeException) {
         // expected
     }
 
-    \Illuminate\Support\Facades\Event::assertDispatched(
-        \SoylentGreenStudio\EnumStates\Events\TransitionFailed::class
+    Event::assertDispatched(
+        TransitionFailed::class
     );
 });

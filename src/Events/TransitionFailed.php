@@ -6,6 +6,7 @@ namespace SoylentGreenStudio\EnumStates\Events;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Foundation\Events\Dispatchable;
+use Throwable;
 
 class TransitionFailed
 {
@@ -16,6 +17,6 @@ class TransitionFailed
         public readonly string $field,
         public readonly mixed $from,
         public readonly mixed $to,
-        public readonly \Throwable $exception,
+        public readonly Throwable $exception,
     ) {}
 }

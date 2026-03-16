@@ -10,6 +10,7 @@ use SoylentGreenStudio\EnumStates\Models\StateTransition;
 use SoylentGreenStudio\EnumStates\StateMachineManager;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Collection;
+use InvalidArgumentException;
 
 /**
  * @mixin Model
@@ -26,6 +27,26 @@ trait HasStateMachines
      * @var array<string, class-string<BackedEnum>>|null
      */
     protected ?array $stateMachineFieldsCache = null;
+
+    /**
+     * Boot the trait: autofill state fields with their #[InitialState] values on model creation.
+     */
+    public static function bootHasStateMachines(): void
+    {
+        static::creating(function (Model $model) {
+            $fields = StateMachineManager::detectStateMachineFields($model);
+
+            foreach ($fields as $field => $enumClass) {
+                if ($model->{$field} === null || ! $model->isDirty($field)) {
+                    $initial = StateMachineManager::getInitialState($enumClass);
+
+                    if ($initial !== null && $model->getAttribute($field) === null) {
+                        $model->{$field} = $initial;
+                    }
+                }
+            }
+        });
+    }
 
     /**
      * Get the state machine fields on this model.
@@ -139,12 +160,18 @@ trait HasStateMachines
         $enumClass = $enum::class;
         $fields = $this->getStateMachineFields();
 
-        foreach ($fields as $field => $class) {
-            if ($class === $enumClass) {
-                return $field;
-            }
+        $matched = array_keys(array_filter($fields, fn (string $class) => $class === $enumClass));
+
+        if (count($matched) === 0) {
+            throw new InvalidArgumentException("No state machine field found for enum [{$enumClass}] on model [" . static::class . '].');
         }
 
-        throw new \InvalidArgumentException("No state machine field found for enum [{$enumClass}] on model [" . static::class . '].');
+        if (count($matched) > 1) {
+            throw new InvalidArgumentException(
+                "Multiple state machine fields [" . implode(', ', $matched) . "] use enum [{$enumClass}] on model [" . static::class . ']. Specify the field name explicitly.'
+            );
+        }
+
+        return $matched[0];
     }
 }
