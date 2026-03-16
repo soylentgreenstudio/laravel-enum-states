@@ -6,7 +6,9 @@ use SoylentGreenStudio\EnumStates\Attributes\InitialState;
 use SoylentGreenStudio\EnumStates\Attributes\Transition;
 use SoylentGreenStudio\EnumStates\Contracts\TransitionHook;
 use SoylentGreenStudio\EnumStates\Models\StateTransition;
+use SoylentGreenStudio\EnumStates\Tests\Support\Factories\HookedOrderFactory;
 use SoylentGreenStudio\EnumStates\Traits\HasStateMachines;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
 // ---- Test-local constructs ----
@@ -56,13 +58,22 @@ class ThrowingHook implements TransitionHook
     }
 }
 
+/**
+ * @method static HookedOrderFactory factory($count = null, $state = [])
+ */
 class HookedOrder extends Model
 {
+    use HasFactory;
     use HasStateMachines;
 
     protected $table = 'orders';
     protected $guarded = [];
     protected $casts = ['status' => HookedStatus::class];
+
+    protected static function newFactory(): HookedOrderFactory
+    {
+        return HookedOrderFactory::new();
+    }
 }
 
 // ---- Tests ----
@@ -72,18 +83,18 @@ beforeEach(function () {
 });
 
 it('runs before and after hooks in order', function () {
-    $order = HookedOrder::create(['status' => 'pending']);
+    $order = HookedOrder::factory()->create(['status' => 'pending']);
 
     $order->transitionTo(HookedStatus::Active, ['key' => 'val']);
 
-    expect(HookLog::$log)->toHaveCount(2);
-    expect(HookLog::$log[0][0])->toBe('before');
-    expect(HookLog::$log[1][0])->toBe('after');
-    expect(HookLog::$log[0][3])->toBe(['key' => 'val']);
+    expect(HookLog::$log)->toHaveCount(2)
+        ->and(HookLog::$log[0][0])->toBe('before')
+        ->and(HookLog::$log[1][0])->toBe('after')
+        ->and(HookLog::$log[0][3])->toBe(['key' => 'val']);
 });
 
 it('rolls back transition when before hook throws', function () {
-    $order = HookedOrder::create(['status' => 'pending']);
+    $order = HookedOrder::factory()->create(['status' => 'pending']);
 
     try {
         $order->transitionTo(HookedStatus::Failed);
@@ -91,11 +102,8 @@ it('rolls back transition when before hook throws', function () {
         // expected
     }
 
-    // Model should NOT have been persisted with new state
-    expect($order->fresh()->status)->toBe(HookedStatus::Pending);
-
-    // No history should exist
-    expect(StateTransition::count())->toBe(0);
+    expect($order->fresh()->status)->toBe(HookedStatus::Pending)
+        ->and(StateTransition::count())->toBe(0);
 });
 
 it('fires TransitionFailed event when hook throws', function () {
@@ -103,7 +111,7 @@ it('fires TransitionFailed event when hook throws', function () {
         \SoylentGreenStudio\EnumStates\Events\TransitionFailed::class,
     ]);
 
-    $order = HookedOrder::create(['status' => 'pending']);
+    $order = HookedOrder::factory()->create(['status' => 'pending']);
 
     try {
         $order->transitionTo(HookedStatus::Failed);

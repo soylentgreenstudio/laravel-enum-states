@@ -6,7 +6,9 @@ use SoylentGreenStudio\EnumStates\Attributes\InitialState;
 use SoylentGreenStudio\EnumStates\Attributes\Transition;
 use SoylentGreenStudio\EnumStates\Contracts\TransitionGuard;
 use SoylentGreenStudio\EnumStates\Exceptions\InvalidTransitionException;
+use SoylentGreenStudio\EnumStates\Tests\Support\Factories\GuardedOrderFactory;
 use SoylentGreenStudio\EnumStates\Traits\HasStateMachines;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
 // ---- Test-local enum and model ----
@@ -38,25 +40,34 @@ class AlwaysAllowGuard implements TransitionGuard
     }
 }
 
+/**
+ * @method static GuardedOrderFactory factory($count = null, $state = [])
+ */
 class GuardedOrder extends Model
 {
+    use HasFactory;
     use HasStateMachines;
 
     protected $table = 'orders';
     protected $guarded = [];
     protected $casts = ['status' => GuardedStatus::class];
+
+    protected static function newFactory(): GuardedOrderFactory
+    {
+        return GuardedOrderFactory::new();
+    }
 }
 
 // ---- Tests ----
 
 it('throws when guard blocks the transition', function () {
-    $order = GuardedOrder::create(['status' => 'pending']);
+    $order = GuardedOrder::factory()->create(['status' => 'pending']);
 
     $order->transitionTo(GuardedStatus::Approved);
 })->throws(InvalidTransitionException::class, 'blocked by guard');
 
 it('allows transition when guard returns true', function () {
-    $order = GuardedOrder::create(['status' => 'pending']);
+    $order = GuardedOrder::factory()->create(['status' => 'pending']);
 
     $order->transitionTo(GuardedStatus::Rejected);
 
@@ -64,10 +75,10 @@ it('allows transition when guard returns true', function () {
 });
 
 it('canTransitionTo returns false when guard blocks', function () {
-    $order = GuardedOrder::create(['status' => 'pending']);
+    $order = GuardedOrder::factory()->create(['status' => 'pending']);
 
-    expect($order->canTransitionTo(GuardedStatus::Approved))->toBeFalse();
-    expect($order->canTransitionTo(GuardedStatus::Rejected))->toBeTrue();
+    expect($order->canTransitionTo(GuardedStatus::Approved))->toBeFalse()
+        ->and($order->canTransitionTo(GuardedStatus::Rejected))->toBeTrue();
 });
 
 it('passes metadata to guard', function () {
@@ -82,7 +93,7 @@ it('passes metadata to guard', function () {
     });
 
     // Use the already-existing model/enum — just test the manager directly
-    $order = GuardedOrder::create(['status' => 'pending']);
+    $order = GuardedOrder::factory()->create(['status' => 'pending']);
 
     // canTransitionTo without metadata should be blocked by AlwaysBlockGuard
     expect($order->canTransitionTo(GuardedStatus::Approved))->toBeFalse();

@@ -11,7 +11,7 @@ use Illuminate\Support\Facades\Event;
 it('fires TransitionStarted and TransitionCompleted events', function () {
     Event::fake([TransitionStarted::class, TransitionCompleted::class]);
 
-    $order = TestOrder::create(['status' => 'pending']);
+    $order = TestOrder::factory()->create(['status' => 'pending']);
     $order->transitionTo(TestOrderStatus::Processing);
 
     Event::assertDispatched(TransitionStarted::class, function ($e) {
@@ -30,7 +30,7 @@ it('fires TransitionStarted and TransitionCompleted events', function () {
 it('includes metadata in events', function () {
     Event::fake([TransitionStarted::class, TransitionCompleted::class]);
 
-    $order = TestOrder::create(['status' => 'pending']);
+    $order = TestOrder::factory()->create(['status' => 'pending']);
     $order->transitionTo(TestOrderStatus::Processing, ['user_id' => 42]);
 
     Event::assertDispatched(TransitionStarted::class, function ($e) {
