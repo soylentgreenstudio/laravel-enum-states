@@ -10,6 +10,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use InvalidArgumentException;
 use SoylentGreenStudio\EnumStates\Contracts\AsyncTransitionHook;
 
 class ProcessTransitionHook implements ShouldQueue
@@ -18,6 +19,8 @@ class ProcessTransitionHook implements ShouldQueue
     use InteractsWithQueue;
     use Queueable;
     use SerializesModels;
+
+    public bool $deleteWhenMissingModels = true;
 
     public function __construct(
         public readonly string $hookClass,
@@ -29,8 +32,14 @@ class ProcessTransitionHook implements ShouldQueue
 
     public function handle(): void
     {
-        /** @var AsyncTransitionHook $hook */
         $hook = app()->make($this->hookClass);
+
+        if (! $hook instanceof AsyncTransitionHook) {
+            throw new InvalidArgumentException(
+                "Hook [{$this->hookClass}] must implement " . AsyncTransitionHook::class . '.'
+            );
+        }
+
         $hook->handle($this->model, $this->from, $this->to, $this->metadata);
     }
 }

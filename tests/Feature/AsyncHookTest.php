@@ -16,6 +16,11 @@ use Illuminate\Support\Facades\Queue;
 
 // ---- Test-local constructs ----
 
+class NotAnAsyncHook
+{
+    public function handle(): void {}
+}
+
 class AsyncBeforeHook implements AsyncTransitionHook
 {
     public static array $log = [];
@@ -236,4 +241,32 @@ it('dispatches both before and after async hooks for same transition', function 
     $order->transitionTo(AsyncHookedStatus::Active);
 
     Queue::assertPushed(ProcessTransitionHook::class, 2);
+});
+
+it('throws when job hook class does not implement AsyncTransitionHook', function () {
+    $order = AsyncHookedOrder::factory()->create(['status' => 'pending']);
+
+    $job = new ProcessTransitionHook(
+        hookClass: NotAnAsyncHook::class,
+        model: $order,
+        from: AsyncHookedStatus::Pending,
+        to: AsyncHookedStatus::Active,
+        metadata: [],
+    );
+
+    $job->handle();
+})->throws(InvalidArgumentException::class, 'must implement');
+
+it('has deleteWhenMissingModels set to true', function () {
+    $order = AsyncHookedOrder::factory()->create(['status' => 'pending']);
+
+    $job = new ProcessTransitionHook(
+        hookClass: AsyncBeforeHook::class,
+        model: $order,
+        from: AsyncHookedStatus::Pending,
+        to: AsyncHookedStatus::Active,
+        metadata: [],
+    );
+
+    expect($job->deleteWhenMissingModels)->toBeTrue();
 });

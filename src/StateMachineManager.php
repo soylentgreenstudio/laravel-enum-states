@@ -301,7 +301,7 @@ class StateMachineManager
             $confirmedFrom = null;
             $pendingAsyncAfterHooks = [];
 
-            DB::transaction(function () use ($model, $field, $to, $metadata, $enumClass, &$confirmedFrom, &$pendingAsyncAfterHooks) {
+            DB::transaction(function () use ($model, $field, $from, $to, $metadata, $enumClass, $preTransition, &$confirmedFrom, &$pendingAsyncAfterHooks) {
                 // 1. Re-read the model with a lock to prevent race conditions
                 $fresh = $model->newQuery()->lockForUpdate()->find($model->getKey());
 
@@ -325,8 +325,13 @@ class StateMachineManager
                 }
 
                 // 3. Find a transition whose guard passes
+                // Reuse pre-transaction result if state hasn't changed (avoids double guard execution)
                 $checkedGuards = [];
-                $transition = static::findAllowedTransition($confirmedFrom, $to, $fresh, $metadata, $checkedGuards);
+                if ($preTransition !== null && $confirmedFrom === $from) {
+                    $transition = $preTransition;
+                } else {
+                    $transition = static::findAllowedTransition($confirmedFrom, $to, $fresh, $metadata, $checkedGuards);
+                }
 
                 if ($transition === null) {
                     throw InvalidTransitionException::guardBlocked($confirmedFrom, $to, $field, implode(', ', $checkedGuards));
@@ -342,9 +347,13 @@ class StateMachineManager
                     }
                 }
 
-                // 5. Update model
+                // 5. Update model (save on $fresh which holds the lock)
+                $fresh->{$field} = $to;
+                $fresh->save();
+
+                // Sync the committed state back to the caller's model instance
                 $model->{$field} = $to;
-                $model->save();
+                $model->syncOriginalAttribute($field);
 
                 // 6. Write history
                 StateTransition::create([

@@ -24,6 +24,26 @@ enum GuardedStatus: string
     case Rejected = 'rejected';
 }
 
+class CountingGuard implements TransitionGuard
+{
+    public static int $count = 0;
+
+    public function allow(Model $model, array $metadata): bool
+    {
+        self::$count++;
+        return true;
+    }
+}
+
+enum CountingGuardStatus: string
+{
+    #[InitialState]
+    #[Transition(to: [self::Done], guard: CountingGuard::class)]
+    case Pending = 'pending';
+
+    case Done = 'done';
+}
+
 class AlwaysBlockGuard implements TransitionGuard
 {
     public function allow(Model $model, array $metadata): bool
@@ -79,6 +99,21 @@ it('canTransitionTo returns false when guard blocks', function () {
 
     expect($order->canTransitionTo(GuardedStatus::Approved))->toBeFalse()
         ->and($order->canTransitionTo(GuardedStatus::Rejected))->toBeTrue();
+});
+
+it('does not call guard twice during transition', function () {
+    // CountingGuard tracks how many times allow() is called
+    CountingGuard::$count = 0;
+
+    $order = GuardedOrder::factory()->create(['status' => 'pending']);
+    $order->mergeCasts(['status' => CountingGuardStatus::class]);
+    $order->status = CountingGuardStatus::Pending;
+
+    $order->transitionTo(CountingGuardStatus::Done);
+
+    // Guard should be called only once (pre-transaction), not twice
+    expect(CountingGuard::$count)->toBe(1)
+        ->and($order->fresh()->status)->toBe(CountingGuardStatus::Done);
 });
 
 it('passes metadata to guard', function () {

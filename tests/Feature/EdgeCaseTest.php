@@ -222,3 +222,22 @@ it('auto-fills initial state when creating model without specifying state', func
 
     expect($order->status)->toBe(TestOrderStatus::Pending);
 });
+
+// ---- Dirty attributes should not leak through transitionTo ----
+
+it('does not persist unrelated dirty attributes during transition', function () {
+    $order = TestOrder::factory()->create(['status' => 'pending', 'payment_status' => 'unpaid']);
+
+    // Set a dirty attribute that should NOT be saved by transitionTo
+    $order->payment_status = 'changed_value';
+
+    $order->transitionTo(TestOrderStatus::Processing);
+
+    // State transitioned
+    expect($order->status)->toBe(TestOrderStatus::Processing);
+
+    // Dirty attribute was NOT persisted to DB
+    $fresh = $order->fresh();
+    expect($fresh->status)->toBe(TestOrderStatus::Processing)
+        ->and($fresh->payment_status)->toBe('unpaid');
+});
