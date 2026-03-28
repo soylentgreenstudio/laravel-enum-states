@@ -14,6 +14,12 @@ class EnumStatesServiceProvider extends ServiceProvider
             $this->publishesMigrations([
                 __DIR__ . '/../database/migrations' => database_path('migrations'),
             ]);
+
+            $this->commands([
+                Commands\EnumStatesGraphCommand::class,
+                Commands\EnumStateMakeCommand::class,
+                Commands\TransitionGuardMakeCommand::class,
+            ]);
         }
     }
 }

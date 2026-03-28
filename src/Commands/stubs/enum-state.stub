@@ -1,0 +1,23 @@
+<?php
+
+namespace {{ namespace }};
+
+use SoylentGreenStudio\EnumStates\Attributes\FinalState;
+use SoylentGreenStudio\EnumStates\Attributes\InitialState;
+use SoylentGreenStudio\EnumStates\Attributes\Transition;
+
+enum {{ class }}: string
+{
+    #[InitialState]
+    #[Transition(to: [self::Completed, self::Cancelled])]
+    case Pending = 'pending';
+
+    #[Transition(to: [self::Completed])]
+    case InProgress = 'in_progress';
+
+    #[FinalState]
+    case Completed = 'completed';
+
+    #[FinalState]
+    case Cancelled = 'cancelled';
+}

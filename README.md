@@ -22,6 +22,8 @@ Declare states, transitions, guards, and hooks via PHP Attributes directly on yo
 - [Transition History](#transition-history)
 - [Query Scopes](#query-scopes)
 - [Events](#events)
+- [Artisan Commands](#artisan-commands)
+- [Async Hooks](#async-hooks)
 - [Testing](#testing)
 - [Comparison with Alternatives](#comparison-with-alternatives)
 - [API Reference](#api-reference)
@@ -92,6 +94,8 @@ $order->stateHistory('status');
 | **DB transactions** | Transitions are wrapped in `DB::transaction()` — hooks and state update are atomic |
 | **Initial / Final states** | Mark states with `#[InitialState]` and `#[FinalState]` attributes |
 | **Metadata** | Pass arbitrary data with each transition — stored in history as JSON |
+| **Async hooks** | Dispatch hooks to queues via `AsyncTransitionHook` — fire-and-forget before, post-commit after |
+| **Artisan commands** | `enum-states:graph`, `make:enum-state`, `make:transition-guard` for visualization and scaffolding |
 | **Container resolution** | Guards and hooks are resolved via Laravel's service container — inject dependencies freely |
 
 ## Installation
@@ -209,8 +213,8 @@ enum OrderStatus: string
 |-----------|------|---------|-------------|
 | `to` | `array` | required | Array of enum cases this state can transition to |
 | `guard` | `?string` | `null` | FQCN of a `TransitionGuard` implementation |
-| `before` | `?string` | `null` | FQCN of a `TransitionHook` — runs before persisting |
-| `after` | `?string` | `null` | FQCN of a `TransitionHook` — runs after persisting |
+| `before` | `?string` | `null` | FQCN of a `TransitionHook` or `AsyncTransitionHook` — runs before persisting |
+| `after` | `?string` | `null` | FQCN of a `TransitionHook` or `AsyncTransitionHook` — runs after persisting |
 
 The `#[Transition]` attribute is repeatable — you can define multiple transition groups on a single case with different guards/hooks:
 
@@ -429,6 +433,122 @@ Event::listen(TransitionCompleted::class, function (TransitionCompleted $event) 
 });
 ```
 
+## Artisan Commands
+
+### Visualize State Graph
+
+```bash
+php artisan enum-states:graph "App\Enums\OrderStatus"
+```
+
+Output:
+
+```
+OrderStatus State Graph
+========================
+[Initial] Pending
+  → Processing (guard: HasItemsInStock)
+  → Cancelled
+Processing
+  → Shipped (before: ValidateShippingAddress)
+  → Cancelled
+[Final] Shipped
+[Final] Cancelled
+```
+
+Generate a Mermaid diagram for documentation:
+
+```bash
+php artisan enum-states:graph "App\Enums\OrderStatus" --format=mermaid
+```
+
+Output:
+
+```
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Processing : guard: HasItemsInStock
+    Pending --> Cancelled
+    Processing --> Shipped : before: ValidateShippingAddress
+    Processing --> Cancelled
+    Shipped --> [*]
+    Cancelled --> [*]
+```
+
+### Generate Enum State
+
+Scaffold a new enum with state machine attributes:
+
+```bash
+php artisan make:enum-state OrderStatus
+```
+
+Creates `app/Enums/OrderStatus.php` with `#[InitialState]`, `#[FinalState]`, and `#[Transition]` boilerplate.
+
+### Generate Transition Guard
+
+Scaffold a new guard class:
+
+```bash
+php artisan make:transition-guard HasItemsInStock
+```
+
+Creates `app/Guards/HasItemsInStock.php` implementing `TransitionGuard`.
+
+## Async Hooks
+
+For hooks that don't need to block the transition, implement the `AsyncTransitionHook` contract. Async hooks are dispatched as queued jobs instead of running synchronously.
+
+```php
+use SoylentGreenStudio\EnumStates\Contracts\AsyncTransitionHook;
+
+class SendShipmentNotification implements AsyncTransitionHook
+{
+    public function handle(Model $model, mixed $from, mixed $to, array $metadata): void
+    {
+        Mail::to($model->user)->send(new OrderShipped($model));
+    }
+
+    public function queue(): ?string
+    {
+        return 'notifications'; // or null for default queue
+    }
+}
+```
+
+Use it the same way as synchronous hooks in the `#[Transition]` attribute:
+
+```php
+#[Transition(
+    to: [self::Shipped],
+    before: ValidateShippingAddress::class,    // sync — runs inside transaction
+    after: SendShipmentNotification::class,     // async — dispatched to queue
+)]
+case Processing = 'processing';
+```
+
+### Behavior
+
+| Hook type | `TransitionHook` (sync) | `AsyncTransitionHook` (async) |
+|-----------|------------------------|-------------------------------|
+| `before` | Runs inside DB transaction, blocks transition | Fire-and-forget: dispatched to queue, does not block |
+| `after` | Runs inside DB transaction, can roll back | Dispatched after successful commit |
+
+- **Sync hooks** continue to work exactly as before (full backward compatibility)
+- **Async before hooks** are dispatched to the queue at the before-hook point but do not block the transition
+- **Async after hooks** are dispatched only after the DB transaction commits successfully
+- The internal `ProcessTransitionHook` job wraps the async hook execution
+
+### AsyncTransitionHook contract
+
+```php
+interface AsyncTransitionHook
+{
+    public function handle(Model $model, mixed $from, mixed $to, array $metadata): void;
+    public function queue(): ?string; // queue name or null for default
+}
+```
+
 ## Testing
 
 ```bash
@@ -447,6 +567,8 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 | `HistoryTest` | History recording, metadata storage, multi-field independence |
 | `ScopeTest` | `whereState`, `whereNotState`, `whereStateIn` |
 | `EventTest` | `TransitionStarted`, `TransitionCompleted`, metadata in events |
+| `AsyncHookTest` | Async hook dispatch, named queues, post-commit dispatch, backward compatibility |
+| `CommandTest` | Graph command (text/mermaid), generator commands, error handling |
 
 ## Comparison with Alternatives
 
@@ -518,6 +640,7 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 |-----------|--------|
 | `TransitionGuard` | `allow(Model $model, array $metadata): bool` |
 | `TransitionHook` | `handle(Model $model, mixed $from, mixed $to, array $metadata): void` |
+| `AsyncTransitionHook` | `handle(...)` + `queue(): ?string` — dispatched as queued job |
 
 ### HasStateMachines trait
 

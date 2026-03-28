@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 namespace SoylentGreenStudio\EnumStates;
 
+use ReflectionException;
 use SoylentGreenStudio\EnumStates\Attributes\FinalState;
 use SoylentGreenStudio\EnumStates\Attributes\InitialState;
 use SoylentGreenStudio\EnumStates\Attributes\Transition;
+use SoylentGreenStudio\EnumStates\Contracts\AsyncTransitionHook;
 use SoylentGreenStudio\EnumStates\Contracts\TransitionGuard;
 use SoylentGreenStudio\EnumStates\Contracts\TransitionHook;
+use SoylentGreenStudio\EnumStates\Jobs\ProcessTransitionHook;
 use SoylentGreenStudio\EnumStates\Events\TransitionCompleted;
 use SoylentGreenStudio\EnumStates\Events\TransitionFailed;
 use SoylentGreenStudio\EnumStates\Events\TransitionStarted;
@@ -30,7 +33,7 @@ class StateMachineManager
     /** @var array<string, string[]> Cache of final states keyed by enum class */
     protected static array $finalStateCache = [];
 
-    /** @var array<string, string[]> Cache of initial states keyed by enum class */
+    /** @var array<string, ?string> Cache of initial state case name keyed by enum class */
     protected static array $initialStateCache = [];
 
     /**
@@ -136,9 +139,9 @@ class StateMachineManager
 
     /**
      * Get the initial state for an enum class, or null if none is marked.
-     */
-    /**
+     *
      * @param class-string<BackedEnum> $enumClass
+     * @throws ReflectionException
      */
     public static function getInitialState(string $enumClass): ?BackedEnum
     {
@@ -262,8 +265,9 @@ class StateMachineManager
         try {
             /** @var BackedEnum $confirmedFrom */
             $confirmedFrom = null;
+            $pendingAsyncAfterHooks = [];
 
-            DB::transaction(function () use ($model, $field, $to, $metadata, $enumClass, &$confirmedFrom) {
+            DB::transaction(function () use ($model, $field, $to, $metadata, $enumClass, &$confirmedFrom, &$pendingAsyncAfterHooks) {
                 // 1. Re-read the model with a lock to prevent race conditions
                 $fresh = $model->newQuery()->lockForUpdate()->find($model->getKey());
 
@@ -295,9 +299,19 @@ class StateMachineManager
 
                 // 4. Run before hook
                 if ($transition->before !== null) {
-                    /** @var TransitionHook $hook */
                     $hook = app()->make($transition->before);
-                    $hook->handle($model, $confirmedFrom, $to, $metadata);
+
+                    if ($hook instanceof AsyncTransitionHook) {
+                        // Fire-and-forget: dispatch to queue, does not block the transition
+                        $pending = ProcessTransitionHook::dispatch(
+                            $transition->before, $model, $confirmedFrom, $to, $metadata
+                        );
+                        if ($hook->queue() !== null) {
+                            $pending->onQueue($hook->queue());
+                        }
+                    } elseif ($hook instanceof TransitionHook) {
+                        $hook->handle($model, $confirmedFrom, $to, $metadata);
+                    }
                 }
 
                 // 5. Update model
@@ -317,11 +331,29 @@ class StateMachineManager
 
                 // 7. Run after hook
                 if ($transition->after !== null) {
-                    /** @var TransitionHook $hook */
                     $hook = app()->make($transition->after);
-                    $hook->handle($model, $confirmedFrom, $to, $metadata);
+
+                    if ($hook instanceof AsyncTransitionHook) {
+                        // Collect for post-commit dispatch
+                        $pendingAsyncAfterHooks[] = [
+                            'hookClass' => $transition->after,
+                            'queue' => $hook->queue(),
+                        ];
+                    } elseif ($hook instanceof TransitionHook) {
+                        $hook->handle($model, $confirmedFrom, $to, $metadata);
+                    }
                 }
             });
+
+            // 8. Dispatch async after-hooks (only after successful commit)
+            foreach ($pendingAsyncAfterHooks as $asyncHook) {
+                $pending = ProcessTransitionHook::dispatch(
+                    $asyncHook['hookClass'], $model, $confirmedFrom ?? $from, $to, $metadata
+                );
+                if ($asyncHook['queue'] !== null) {
+                    $pending->onQueue($asyncHook['queue']);
+                }
+            }
 
             // Fire TransitionCompleted with the confirmed from-state
             event(new TransitionCompleted($model, $field, $confirmedFrom ?? $from, $to, $metadata));

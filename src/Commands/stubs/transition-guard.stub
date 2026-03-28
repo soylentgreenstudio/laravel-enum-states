@@ -1,0 +1,14 @@
+<?php
+
+namespace {{ namespace }};
+
+use Illuminate\Database\Eloquent\Model;
+use SoylentGreenStudio\EnumStates\Contracts\TransitionGuard;
+
+class {{ class }} implements TransitionGuard
+{
+    public function allow(Model $model, array $metadata): bool
+    {
+        //
+    }
+}
