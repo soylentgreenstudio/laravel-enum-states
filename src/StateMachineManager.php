@@ -22,6 +22,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
 use BackedEnum;
 use ReflectionEnum;
+use InvalidArgumentException;
 use RuntimeException;
 use Throwable;
 
@@ -36,6 +37,9 @@ class StateMachineManager
     /** @var array<string, ?string> Cache of initial state case name keyed by enum class */
     protected static array $initialStateCache = [];
 
+    /** @var array<string, array<string, class-string<BackedEnum>>> Cache of detected fields keyed by model class */
+    protected static array $fieldDetectionCache = [];
+
     /**
      * Detect which fields on a model are state machine fields.
      *
@@ -43,9 +47,16 @@ class StateMachineManager
      */
     public static function detectStateMachineFields(Model $model): array
     {
+        $casts = $model->getCasts();
+        $cacheKey = $model::class . '@' . crc32(json_encode($casts));
+
+        if (isset(static::$fieldDetectionCache[$cacheKey])) {
+            return static::$fieldDetectionCache[$cacheKey];
+        }
+
         $fields = [];
 
-        foreach ($model->getCasts() as $field => $castType) {
+        foreach ($casts as $field => $castType) {
             if (! is_string($castType)) {
                 continue;
             }
@@ -65,7 +76,7 @@ class StateMachineManager
             }
         }
 
-        return $fields;
+        return static::$fieldDetectionCache[$cacheKey] = $fields;
     }
 
     /**
@@ -213,7 +224,7 @@ class StateMachineManager
      * Find the first Transition whose guard (if any) passes.
      * Returns null if no matching transition exists or all guards block.
      */
-    protected static function findAllowedTransition(BackedEnum $from, BackedEnum $to, Model $model, array $metadata = []): ?Transition
+    protected static function findAllowedTransition(BackedEnum $from, BackedEnum $to, Model $model, array $metadata = [], array &$checkedGuards = []): ?Transition
     {
         $transitions = static::findTransitions($from, $to);
 
@@ -222,8 +233,15 @@ class StateMachineManager
                 return $transition;
             }
 
-            /** @var TransitionGuard $guard */
             $guard = app()->make($transition->guard);
+
+            if (! $guard instanceof TransitionGuard) {
+                throw new InvalidArgumentException(
+                    "Guard [{$transition->guard}] must implement " . TransitionGuard::class . '.'
+                );
+            }
+
+            $checkedGuards[] = $transition->guard;
 
             if ($guard->allow($model, $metadata)) {
                 return $transition;
@@ -259,6 +277,22 @@ class StateMachineManager
             throw InvalidTransitionException::notAllowed($from, $to, $field);
         }
 
+        // Dispatch async before hook (fire-and-forget, before transaction)
+        $preTransition = static::findAllowedTransition($from, $to, $model, $metadata);
+        if ($preTransition !== null && $preTransition->before !== null) {
+            $hook = app()->make($preTransition->before);
+            static::validateHookInterface($hook, $preTransition->before);
+
+            if ($hook instanceof AsyncTransitionHook) {
+                $pending = ProcessTransitionHook::dispatch(
+                    $preTransition->before, $model, $from, $to, $metadata
+                );
+                if ($hook->queue() !== null) {
+                    $pending->onQueue($hook->queue());
+                }
+            }
+        }
+
         // Fire TransitionStarted with the in-memory state
         event(new TransitionStarted($model, $field, $from, $to, $metadata));
 
@@ -291,25 +325,19 @@ class StateMachineManager
                 }
 
                 // 3. Find a transition whose guard passes
-                $transition = static::findAllowedTransition($confirmedFrom, $to, $fresh, $metadata);
+                $checkedGuards = [];
+                $transition = static::findAllowedTransition($confirmedFrom, $to, $fresh, $metadata, $checkedGuards);
 
                 if ($transition === null) {
-                    throw InvalidTransitionException::guardBlocked($confirmedFrom, $to, $field, 'all matching guards');
+                    throw InvalidTransitionException::guardBlocked($confirmedFrom, $to, $field, implode(', ', $checkedGuards));
                 }
 
-                // 4. Run before hook
+                // 4. Run sync before hook (async already dispatched pre-transaction)
                 if ($transition->before !== null) {
                     $hook = app()->make($transition->before);
+                    static::validateHookInterface($hook, $transition->before);
 
-                    if ($hook instanceof AsyncTransitionHook) {
-                        // Fire-and-forget: dispatch to queue, does not block the transition
-                        $pending = ProcessTransitionHook::dispatch(
-                            $transition->before, $model, $confirmedFrom, $to, $metadata
-                        );
-                        if ($hook->queue() !== null) {
-                            $pending->onQueue($hook->queue());
-                        }
-                    } elseif ($hook instanceof TransitionHook) {
+                    if ($hook instanceof TransitionHook && ! ($hook instanceof AsyncTransitionHook)) {
                         $hook->handle($model, $confirmedFrom, $to, $metadata);
                     }
                 }
@@ -332,6 +360,7 @@ class StateMachineManager
                 // 7. Run after hook
                 if ($transition->after !== null) {
                     $hook = app()->make($transition->after);
+                    static::validateHookInterface($hook, $transition->after);
 
                     if ($hook instanceof AsyncTransitionHook) {
                         // Collect for post-commit dispatch
@@ -365,6 +394,18 @@ class StateMachineManager
     }
 
     /**
+     * Validate that a resolved hook implements TransitionHook or AsyncTransitionHook.
+     */
+    protected static function validateHookInterface(object $hook, string $hookClass): void
+    {
+        if (! $hook instanceof TransitionHook && ! $hook instanceof AsyncTransitionHook) {
+            throw new InvalidArgumentException(
+                "Hook [{$hookClass}] must implement " . TransitionHook::class . ' or ' . AsyncTransitionHook::class . '.'
+            );
+        }
+    }
+
+    /**
      * Clear the internal reflection caches (useful for testing).
      */
     public static function clearCache(): void
@@ -372,5 +413,6 @@ class StateMachineManager
         static::$transitionCache = [];
         static::$finalStateCache = [];
         static::$initialStateCache = [];
+        static::$fieldDetectionCache = [];
     }
 }
