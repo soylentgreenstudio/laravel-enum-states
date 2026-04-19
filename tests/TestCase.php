@@ -35,8 +35,8 @@ abstract class TestCase extends OrchestraTestCase
             $table->timestamps();
         });
 
-        // Run the package migration
-        $migration = include __DIR__ . '/../database/migrations/2024_01_01_000000_create_state_transitions_table.php';
+        // Run the package migration (stub is evaluated as PHP; extension does not matter for include)
+        $migration = include __DIR__ . '/../database/migrations/create_state_transitions_table.php.stub';
         $migration->up();
     }
 }

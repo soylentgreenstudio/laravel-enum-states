@@ -11,8 +11,6 @@ class StateTransition extends Model
 {
     public $timestamps = false;
 
-    protected $table = 'state_transitions';
-
     protected $guarded = [];
 
     protected $casts = [
@@ -20,6 +18,13 @@ class StateTransition extends Model
         'transitioned_at' => 'datetime',
         'created_at' => 'datetime',
     ];
+
+    public function __construct(array $attributes = [])
+    {
+        $this->setTable(config('enum-states.table', 'state_transitions'));
+
+        parent::__construct($attributes);
+    }
 
     public function model(): MorphTo
     {

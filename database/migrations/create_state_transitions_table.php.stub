@@ -8,7 +8,7 @@ return new class extends Migration
 {
     public function up(): void
     {
-        Schema::create('state_transitions', function (Blueprint $table) {
+        Schema::create(config('enum-states.table', 'state_transitions'), function (Blueprint $table) {
             $table->id();
             $table->morphs('model');
             $table->string('field');
@@ -24,6 +24,6 @@ return new class extends Migration
 
     public function down(): void
     {
-        Schema::dropIfExists('state_transitions');
+        Schema::dropIfExists(config('enum-states.table', 'state_transitions'));
     }
 };

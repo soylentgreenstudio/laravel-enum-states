@@ -6,17 +6,19 @@
 
 **A state machine library for Laravel using native PHP 8.1 Backed Enums as the single source of truth.**
 
-Declare states, transitions, guards, and hooks via PHP Attributes directly on your Enum — no separate state classes, no config files, no boilerplate.
+Declare states, transitions, guards, and hooks via PHP Attributes directly on your Enum — no separate state classes, no boilerplate.
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
 - [Features](#features)
 - [Installation](#installation)
+- [Configuration](#configuration)
 - [Architecture](#architecture)
 - [Enum Definition](#enum-definition)
 - [Model Setup](#model-setup)
 - [Transitioning States](#transitioning-states)
+- [Reverse / Wildcard Transitions](#reverse--wildcard-transitions)
 - [Guards](#guards)
 - [Hooks](#hooks)
 - [Transition History](#transition-history)
@@ -33,7 +35,7 @@ Declare states, transitions, guards, and hooks via PHP Attributes directly on yo
 
 ```bash
 composer require soylentgreenstudio/laravel-enum-states
-php artisan vendor:publish --provider="SoylentGreenStudio\EnumStates\EnumStatesServiceProvider"
+php artisan vendor:publish --tag=enum-states-migrations
 php artisan migrate
 ```
 
@@ -42,16 +44,18 @@ php artisan migrate
 enum OrderStatus: string
 {
     #[InitialState]
-    #[Transition(to: [self::Processing, self::Cancelled])]
+    #[Transition(to: [self::Processing])]
     case Pending = 'pending';
 
-    #[Transition(to: [self::Shipped, self::Cancelled])]
+    #[Transition(to: [self::Shipped])]
     case Processing = 'processing';
 
     #[FinalState]
     case Shipped = 'shipped';
 
+    // Reachable from any non-final case — no need to list it on each source
     #[FinalState]
+    #[TransitionFrom(from: '*')]
     case Cancelled = 'cancelled';
 }
 
@@ -85,13 +89,16 @@ $order->stateHistory('status');
 |---------|-------------|
 | **Enum-driven** | States and transitions declared via PHP Attributes on Backed Enums |
 | **Zero config** | Trait auto-detects state machine fields from `$casts` — no registration needed |
+| **Reverse / wildcard transitions** | Declare inbound edges on the target state with `#[TransitionFrom(from: '*')]` or an explicit case list |
 | **Guards** | Control whether a transition is allowed via `TransitionGuard` contract |
+| **Multiple guards (AND)** | Pass `guard: [GuardA::class, GuardB::class]` — every guard in the array must pass |
 | **Hooks** | Run logic before/after transition via `TransitionHook` contract |
-| **Transition history** | Every transition recorded in `state_transitions` table with metadata |
+| **Transition history** | Every transition recorded with metadata in a configurable history table |
+| **Configurable table name** | Override the history table via `config/enum-states.php` or the `ENUM_STATES_TABLE` env var |
 | **Query scopes** | `whereState`, `whereNotState`, `whereStateIn` — filter models by state |
 | **Events** | `TransitionStarted`, `TransitionCompleted`, `TransitionFailed` fired automatically |
 | **Multiple state machines** | One model can have multiple state fields, each independent |
-| **DB transactions** | Transitions are wrapped in `DB::transaction()` — hooks and state update are atomic |
+| **DB transactions** | Transitions wrapped in `DB::transaction()` with pessimistic locking — hooks and state update are atomic |
 | **Initial / Final states** | Mark states with `#[InitialState]` and `#[FinalState]` attributes |
 | **Metadata** | Pass arbitrary data with each transition — stored in history as JSON |
 | **Async hooks** | Dispatch hooks to queues via `AsyncTransitionHook` — fire-and-forget before, post-commit after |
@@ -111,14 +118,51 @@ $order->stateHistory('status');
 composer require soylentgreenstudio/laravel-enum-states
 ```
 
-### Publish and run migration
+### Publish the migration
 
 ```bash
-php artisan vendor:publish --provider="SoylentGreenStudio\EnumStates\EnumStatesServiceProvider"
+php artisan vendor:publish --tag=enum-states-migrations
 php artisan migrate
 ```
 
-This creates the `state_transitions` table used for transition history.
+This copies `create_state_transitions_table.php.stub` to your application's `database/migrations/` with a fresh timestamp and creates the history table (default name: `state_transitions`).
+
+### Publish the config (optional)
+
+Only needed if you want to rename the history table or override defaults:
+
+```bash
+php artisan vendor:publish --tag=enum-states-config
+```
+
+This creates `config/enum-states.php` in your application.
+
+## Configuration
+
+The package ships with a single config file, `config/enum-states.php`:
+
+```php
+return [
+    'table' => env('ENUM_STATES_TABLE', 'state_transitions'),
+];
+```
+
+### Customizing the history table name
+
+If `state_transitions` conflicts with an existing table or doesn't fit your naming convention, override it via `.env`:
+
+```bash
+ENUM_STATES_TABLE=audit_state_transitions
+```
+
+Or publish the config and edit directly:
+
+```php
+// config/enum-states.php
+'table' => 'audit_state_transitions',
+```
+
+**Important:** set this value **before** running `php artisan migrate` — the migration reads the config value at runtime, and the `StateTransition` model resolves its table name on construction.
 
 ## Architecture
 
@@ -127,16 +171,18 @@ This creates the `state_transitions` table used for transition history.
 ```
 $order->transitionTo(OrderStatus::Processing, $metadata)
   └─ StateMachineManager::transition()
-      ├─ 1. Check current state is not #[FinalState]  → FinalStateException
-      ├─ 2. Find matching #[Transition] attribute      → InvalidTransitionException
-      ├─ 3. Resolve and run Guard via app()->make()    → InvalidTransitionException
+      ├─ 1. Check current state is not #[FinalState]   → FinalStateException
+      ├─ 2. Find a matching #[Transition] edge          → InvalidTransitionException
+      ├─ 3. Resolve guard(s) and verify all allow       → InvalidTransitionException
       ├─ 4. Fire TransitionStarted event
-      └─ 5. DB::transaction()
-            ├─ Run `before` hook
+      └─ 5. DB::transaction() with lockForUpdate()
+            ├─ Re-read and re-validate under the lock
+            ├─ Run `before` hook (sync)
             ├─ Update model field + save
-            ├─ Write record to state_transitions table
-            └─ Run `after` hook
-      ├─ 6. Fire TransitionCompleted event
+            ├─ Write record to history table
+            └─ Run `after` hook (sync; async collected for post-commit)
+      ├─ 6. Dispatch any async after-hooks (post-commit)
+      ├─ 7. Fire TransitionCompleted event
       └─ On exception: Fire TransitionFailed event, re-throw
 ```
 
@@ -145,14 +191,14 @@ $order->transitionTo(OrderStatus::Processing, $metadata)
 The `HasStateMachines` trait inspects the model's `$casts` array on first access:
 
 1. For each cast that points to a `BackedEnum` class
-2. Check if any case on that enum has `#[Transition]`, `#[InitialState]`, or `#[FinalState]` attributes
+2. Check if any case on that enum has `#[Transition]`, `#[TransitionFrom]`, `#[InitialState]`, or `#[FinalState]` attributes
 3. Register those fields as managed state machines
 
 No manual field registration required.
 
 ### Database schema
 
-The `state_transitions` table stores full transition history:
+The history table (default name `state_transitions`, override via `config('enum-states.table')`) stores full transition history:
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -174,19 +220,20 @@ Define your states as a PHP 8.1 Backed Enum. Use attributes to declare the state
 use SoylentGreenStudio\EnumStates\Attributes\InitialState;
 use SoylentGreenStudio\EnumStates\Attributes\FinalState;
 use SoylentGreenStudio\EnumStates\Attributes\Transition;
+use SoylentGreenStudio\EnumStates\Attributes\TransitionFrom;
 
 enum OrderStatus: string
 {
     #[InitialState]
     #[Transition(
-        to: [self::Processing, self::Cancelled],
+        to: [self::Processing],
         guard: HasItemsInStock::class,
         after: SendOrderConfirmation::class,
     )]
     case Pending = 'pending';
 
     #[Transition(
-        to: [self::Shipped, self::Cancelled],
+        to: [self::Shipped],
         before: ValidateShippingAddress::class,
     )]
     case Processing = 'processing';
@@ -194,7 +241,9 @@ enum OrderStatus: string
     #[FinalState]
     case Shipped = 'shipped';
 
+    // Reverse-declared: reachable from any non-final case
     #[FinalState]
+    #[TransitionFrom(from: '*')]
     case Cancelled = 'cancelled';
 }
 ```
@@ -205,18 +254,19 @@ enum OrderStatus: string
 |-----------|--------|-------------|
 | `#[InitialState]` | Enum case | Marks the default/starting state |
 | `#[FinalState]` | Enum case | Marks a terminal state — no transitions allowed from it |
-| `#[Transition]` | Enum case (repeatable) | Declares allowed transitions from this state |
+| `#[Transition]` | Enum case (repeatable) | Declares outbound transitions from this state |
+| `#[TransitionFrom]` | Enum case (repeatable) | Declares inbound transitions to this state from the given sources |
 
 ### Transition attribute parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `to` | `array` | required | Array of enum cases this state can transition to |
-| `guard` | `?string` | `null` | FQCN of a `TransitionGuard` implementation |
+| `guard` | `string\|array\|null` | `null` | FQCN of a `TransitionGuard`, or an array of FQCNs (AND-combined) |
 | `before` | `?string` | `null` | FQCN of a `TransitionHook` or `AsyncTransitionHook` — runs before persisting |
 | `after` | `?string` | `null` | FQCN of a `TransitionHook` or `AsyncTransitionHook` — runs after persisting |
 
-The `#[Transition]` attribute is repeatable — you can define multiple transition groups on a single case with different guards/hooks:
+The `#[Transition]` attribute is repeatable — you can stack multiple transitions on one case (OR semantics across attributes):
 
 ```php
 #[Transition(to: [self::Approved], guard: ManagerApproval::class)]
@@ -286,8 +336,102 @@ if ($order->canTransitionTo(OrderStatus::Shipped)) {
 | Exception | When |
 |-----------|------|
 | `FinalStateException` | Transitioning from a state marked `#[FinalState]` |
-| `InvalidTransitionException` | No `#[Transition]` allows the requested state change |
-| `InvalidTransitionException` | Guard returned `false` |
+| `InvalidTransitionException` | No `#[Transition]`/`#[TransitionFrom]` allows the requested state change |
+| `InvalidTransitionException` | All guards for the matching transitions returned `false` — message lists the guard class names |
+
+## Reverse / Wildcard Transitions
+
+Sometimes a state is reachable from many source states. Rather than duplicate `#[Transition(to: [self::Cancelled])]` on every source case, declare the inbound direction on the **target** case with `#[TransitionFrom]`.
+
+### Wildcard: reachable from any non-final state
+
+Use the `'*'` sentinel to make the target reachable from every non-final case (excluding the target itself and any `#[FinalState]` case):
+
+```php
+enum OrderStatus: string
+{
+    #[InitialState]
+    #[Transition(to: [self::Processing])]
+    case Pending = 'pending';
+
+    #[Transition(to: [self::Shipped])]
+    case Processing = 'processing';
+
+    #[FinalState]
+    case Shipped = 'shipped';
+
+    // Cancelled is reachable from Pending and Processing —
+    // without touching those cases' own attribute lists.
+    #[FinalState]
+    #[TransitionFrom(from: '*')]
+    case Cancelled = 'cancelled';
+}
+```
+
+### Explicit source list
+
+Pass an array of enum cases (of the same enum) to enumerate allowed sources:
+
+```php
+enum DocumentStatus: string
+{
+    #[InitialState]
+    case Draft = 'draft';
+
+    case Review = 'review';
+    case Approved = 'approved';
+
+    // Archived from Draft or Review — but NOT from Approved
+    #[FinalState]
+    #[TransitionFrom(from: [self::Draft, self::Review])]
+    case Archived = 'archived';
+}
+```
+
+### With guards and hooks
+
+`#[TransitionFrom]` accepts the same `guard`, `before`, and `after` parameters as `#[Transition]`:
+
+```php
+#[FinalState]
+#[TransitionFrom(
+    from: '*',
+    guard: [IsAdmin::class, HasCloseReason::class],
+    after: NotifyClosureWebhook::class,
+)]
+case Closed = 'closed';
+```
+
+### Wildcard semantics
+
+- `from: '*'` expands to every non-final case of the enum **except the target itself**. No self-loop is created, and final states are never included as sources.
+- The expansion is resolved once per enum class and cached — there is no runtime overhead compared to hand-written `#[Transition]` attributes.
+- Reverse edges are visible in `enum-states:graph` output just like forward transitions.
+
+### Mixing forward and reverse on the same edge
+
+Forward `#[Transition]` on a source case and reverse `#[TransitionFrom]` on the target case may cover the same edge. Both contribute separate `Transition` objects to the source case; OR semantics between them means the transition is permitted if **either** attribute allows it:
+
+```php
+enum Status: string
+{
+    #[InitialState]
+    #[Transition(to: [self::Done], guard: FastPathGuard::class)]
+    case Pending = 'pending';
+
+    #[TransitionFrom(from: [self::Pending], guard: FallbackGuard::class)]
+    case Done = 'done';
+}
+```
+
+### TransitionFrom attribute parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `from` | `string\|array` | required | `'*'` for all non-final cases (excluding the target), or an array of BackedEnum cases of the same enum |
+| `guard` | `string\|array\|null` | `null` | Single guard or AND-combined array |
+| `before` | `?string` | `null` | Before-hook FQCN |
+| `after` | `?string` | `null` | After-hook FQCN |
 
 ## Guards
 
@@ -323,6 +467,40 @@ class HasSufficientBalance implements TransitionGuard
         return $this->gateway->getBalance($model->user_id) >= $model->total;
     }
 }
+```
+
+### Multiple guards per transition (AND)
+
+Pass an array of guard classes to require **all** of them to return `true`:
+
+```php
+#[Transition(
+    to: [self::Approved],
+    guard: [IsAdmin::class, HasApprovalPermission::class, BudgetAvailable::class],
+)]
+case Pending = 'pending';
+```
+
+Semantics:
+- Every guard in the array must return `true` for the transition to be allowed.
+- Guards are evaluated in array order. The first `false` short-circuits the rest.
+- On failure, `InvalidTransitionException` lists every guard class name that was checked.
+
+A single string guard continues to work unchanged — passing `guard: IsAdmin::class` is equivalent to `guard: [IsAdmin::class]`.
+
+### AND vs OR
+
+| Goal | Syntax |
+|------|--------|
+| **All** guards must pass (AND) | One `#[Transition]` with `guard: [A::class, B::class]` |
+| **Any** guard may pass (OR) | Multiple stacked `#[Transition]` attributes with different guards |
+
+Example — admin can approve directly, or a manager with budget approval can approve:
+
+```php
+#[Transition(to: [self::Approved], guard: IsAdmin::class)]
+#[Transition(to: [self::Approved], guard: [IsManager::class, BudgetAvailable::class])]
+case Pending = 'pending';
 ```
 
 ## Hooks
@@ -368,7 +546,7 @@ class NotifySlack implements TransitionHook
 
 ## Transition History
 
-Every transition is recorded in the `state_transitions` table:
+Every transition is recorded in the history table (default `state_transitions`, configurable):
 
 ```php
 // History for a specific field
@@ -455,6 +633,10 @@ Processing
 [Final] Shipped
 [Final] Cancelled
 ```
+
+When an array of guards is used, they are joined with `+` in the output (e.g. `guard: IsAdmin+HasBudget`) to signal AND-combination.
+
+Virtual edges contributed by `#[TransitionFrom]` are rendered alongside forward transitions — no special flag needed.
 
 Generate a Mermaid diagram for documentation:
 
@@ -562,13 +744,18 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 | Suite | Covers |
 |-------|--------|
 | `TransitionTest` | Happy path transitions, disallowed transitions, final state enforcement, auto-detection |
-| `GuardTest` | Guard blocking, guard allowing, `canTransitionTo` with guards |
+| `GuardTest` | Guard blocking, guard allowing, `canTransitionTo` with guards, double-guard prevention |
+| `MultiGuardTest` | AND-combined guard arrays, short-circuit on first false, exception message content, backward compat with single string guard |
+| `WildcardTransitionTest` | `#[TransitionFrom]` wildcard + explicit list, final-state and self-loop exclusion, merged forward/reverse edges, guards on reverse, graph rendering |
+| `ConfigTableTest` | Default table name, config override at construction, migration against default name |
 | `HookTest` | Before/after hook execution order, rollback on hook exception |
 | `HistoryTest` | History recording, metadata storage, multi-field independence |
 | `ScopeTest` | `whereState`, `whereNotState`, `whereStateIn` |
 | `EventTest` | `TransitionStarted`, `TransitionCompleted`, metadata in events |
 | `AsyncHookTest` | Async hook dispatch, named queues, post-commit dispatch, backward compatibility |
 | `CommandTest` | Graph command (text/mermaid), generator commands, error handling |
+| `EdgeCaseTest` | Multiple `#[Transition]` OR-semantics, duplicate enum on fields, initial+final on same case, plain model |
+| `ValidationTest` | Guards/hooks not implementing contracts, reflection cache invalidation, descriptive error messages |
 
 ## Comparison with Alternatives
 
@@ -577,11 +764,12 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 | Aspect | spatie/laravel-model-states | laravel-enum-states |
 |--------|---------------------------|---------------------|
 | **State definition** | Separate PHP classes per state | Native PHP Backed Enum cases |
-| **Transitions** | Separate `Transition` classes or `$transitions` array | `#[Transition]` attributes on enum cases |
+| **Transitions** | Separate `Transition` classes or `$transitions` array | `#[Transition]` / `#[TransitionFrom]` attributes on enum cases |
 | **Configuration** | `$states` config in model + state classes | `$casts` only — auto-detected from enum attributes |
-| **Guards** | Inside transition classes or `canTransitionTo()` method | Dedicated `TransitionGuard` contract, container-resolved |
-| **Hooks** | Transition class `handle()` + events | `before`/`after` hooks on `#[Transition]` attribute |
-| **History** | Via separate package or custom | Built-in `state_transitions` table |
+| **Guards** | Inside transition classes or `canTransitionTo()` method | Dedicated `TransitionGuard` contract, container-resolved, AND-combined arrays |
+| **Reverse / wildcard** | Manual duplication per source | `#[TransitionFrom(from: '*')]` on the target |
+| **Hooks** | Transition class `handle()` + events | `before`/`after` hooks on the attribute, sync or async |
+| **History** | Via separate package or custom | Built-in, configurable table name |
 | **Multiple fields** | Supported, requires explicit config | Supported, auto-detected from `$casts` |
 | **Boilerplate** | 1 class per state + 1 class per transition | 1 enum + attributes only |
 | **PHP version** | PHP 8.0+ | PHP 8.1+ (requires Backed Enums) |
@@ -589,8 +777,9 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 **Advantages of laravel-enum-states:**
 - Zero boilerplate — no separate state/transition classes
 - Everything declared in one place — the Enum itself
-- Native PHP Enums for type safety — IDE autocomplete, exhaustive match
-- Built-in transition history with metadata
+- Native PHP Enums for type safety — IDE autocomplete, exhaustive `match`
+- Reverse/wildcard transitions and multi-guard AND out of the box
+- Built-in transition history with metadata, configurable table name
 - Guards and hooks resolved via service container
 
 **Disadvantages compared to spatie:**
@@ -605,8 +794,8 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 |--------|------------|---------------------|
 | **State definition** | `StateMachine` class with `$initialState` and `$transitions` | Backed Enum with `#[Transition]` attributes |
 | **Configuration** | `$stateMachines` array in model | Auto-detected from `$casts` |
-| **History** | Built-in | Built-in |
-| **Guards** | `beforeTransitionHook()` in StateMachine class | Dedicated `TransitionGuard` contract |
+| **History** | Built-in | Built-in, configurable table name |
+| **Guards** | `beforeTransitionHook()` in StateMachine class | Dedicated `TransitionGuard` contract, AND-combined arrays |
 | **Type safety** | String-based states | Enum-based — IDE autocomplete, type checking |
 
 ### Summary: When to use laravel-enum-states
@@ -615,7 +804,8 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 - You want states defined as native PHP Enums with full type safety
 - You prefer zero-config auto-detection over manual registration
 - You want guards and hooks as separate, testable, injectable classes
-- You need built-in transition history with metadata
+- You need built-in transition history with metadata and a configurable table name
+- You want reverse/wildcard transitions without hand-written duplication
 - You want everything declared in one place — the Enum
 
 **Choose alternatives when:**
@@ -632,7 +822,8 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 |-----------|--------|------------|
 | `#[InitialState]` | Enum case | — |
 | `#[FinalState]` | Enum case | — |
-| `#[Transition]` | Enum case (repeatable) | `to: array`, `?guard: string`, `?before: string`, `?after: string` |
+| `#[Transition]` | Enum case (repeatable) | `to: array`, `guard: string\|array\|null`, `before: ?string`, `after: ?string` |
+| `#[TransitionFrom]` | Enum case (repeatable) | `from: string\|array`, `guard: string\|array\|null`, `before: ?string`, `after: ?string` |
 
 ### Contracts
 
@@ -674,13 +865,26 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 | Exception | When thrown |
 |-----------|------------|
 | `FinalStateException` | Attempting to transition from a `#[FinalState]` |
-| `InvalidTransitionException` | No matching `#[Transition]` found, or guard returned `false` |
+| `InvalidTransitionException` | No matching `#[Transition]`/`#[TransitionFrom]` found, or every matching transition was blocked by its guard(s) |
+
+### Configuration
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enum-states.table` | `state_transitions` (overridable via `ENUM_STATES_TABLE` env) | Name of the history table |
+
+### Publishable assets
+
+| Tag | Publishes |
+|-----|-----------|
+| `enum-states-migrations` | The migration stub as a timestamped migration in `database/migrations/` |
+| `enum-states-config` | `config/enum-states.php` into the application's config directory |
 
 ### Models
 
 | Class | Table | Description |
 |-------|-------|-------------|
-| `StateTransition` | `state_transitions` | Polymorphic history record with `from`, `to`, `field`, `metadata`, `transitioned_at` |
+| `StateTransition` | `config('enum-states.table')` (default `state_transitions`) | Polymorphic history record with `from`, `to`, `field`, `metadata`, `transitioned_at` |
 
 ## License
 

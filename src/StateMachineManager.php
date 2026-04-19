@@ -4,10 +4,13 @@ declare(strict_types=1);
 
 namespace SoylentGreenStudio\EnumStates;
 
+use Illuminate\Contracts\Container\BindingResolutionException;
+use ReflectionEnumUnitCase;
 use ReflectionException;
 use SoylentGreenStudio\EnumStates\Attributes\FinalState;
 use SoylentGreenStudio\EnumStates\Attributes\InitialState;
 use SoylentGreenStudio\EnumStates\Attributes\Transition;
+use SoylentGreenStudio\EnumStates\Attributes\TransitionFrom;
 use SoylentGreenStudio\EnumStates\Contracts\AsyncTransitionHook;
 use SoylentGreenStudio\EnumStates\Contracts\TransitionGuard;
 use SoylentGreenStudio\EnumStates\Contracts\TransitionHook;
@@ -88,6 +91,9 @@ class StateMachineManager
             if (! empty($case->getAttributes(Transition::class))) {
                 return true;
             }
+            if (! empty($case->getAttributes(TransitionFrom::class))) {
+                return true;
+            }
             if (! empty($case->getAttributes(InitialState::class))) {
                 return true;
             }
@@ -102,8 +108,13 @@ class StateMachineManager
     /**
      * Get all transitions for an enum class, indexed by case name.
      *
+     * Direct #[Transition] attributes are collected first, then every
+     * #[TransitionFrom] on any case is expanded into virtual forward
+     * Transition objects appended to the corresponding source cases.
+     *
      * @param class-string<BackedEnum> $enumClass
      * @return array<string, Transition[]>
+     * @throws ReflectionException
      */
     public static function getTransitions(string $enumClass): array
     {
@@ -111,24 +122,110 @@ class StateMachineManager
             return static::$transitionCache[$enumClass];
         }
 
-        $transitions = [];
         $reflection = new ReflectionEnum($enumClass);
+        $cases = $reflection->getCases();
 
-        foreach ($reflection->getCases() as $case) {
-            $attrs = $case->getAttributes(Transition::class);
+        $transitions = [];
+        foreach ($cases as $case) {
             $transitions[$case->getName()] = array_map(
                 fn ($attr) => $attr->newInstance(),
-                $attrs
+                $case->getAttributes(Transition::class)
             );
+        }
+
+        $finalNames = [];
+        foreach ($cases as $case) {
+            if (! empty($case->getAttributes(FinalState::class))) {
+                $finalNames[] = $case->getName();
+            }
+        }
+
+        foreach ($cases as $targetCase) {
+            $targetAttrs = $targetCase->getAttributes(TransitionFrom::class);
+            if (empty($targetAttrs)) {
+                continue;
+            }
+
+            $targetEnum = $enumClass::from($targetCase->getBackingValue());
+
+            foreach ($targetAttrs as $attr) {
+                /** @var TransitionFrom $reverse */
+                $reverse = $attr->newInstance();
+                $sources = static::expandReverseSources(
+                    $reverse->from,
+                    $enumClass,
+                    $targetCase,
+                    $cases,
+                    $finalNames
+                );
+
+                foreach ($sources as $source) {
+                    $transitions[$source->name][] = new Transition(
+                        to: [$targetEnum],
+                        guard: $reverse->guard,
+                        before: $reverse->before,
+                        after: $reverse->after,
+                    );
+                }
+            }
         }
 
         return static::$transitionCache[$enumClass] = $transitions;
     }
 
     /**
+     * Expand a TransitionFrom::$from declaration into concrete source enum cases.
+     *
+     * @param  string|array<int, BackedEnum>  $from
+     * @param  class-string<BackedEnum>  $enumClass
+     * @param  ReflectionEnumUnitCase[]  $cases
+     * @param  string[]  $finalNames
+     * @return BackedEnum[]
+     */
+    protected static function expandReverseSources(
+        string|array $from,
+        string $enumClass,
+        ReflectionEnumUnitCase $targetCase,
+        array $cases,
+        array $finalNames
+    ): array {
+        if ($from === TransitionFrom::WILDCARD || $from === [TransitionFrom::WILDCARD]) {
+            $result = [];
+            foreach ($cases as $case) {
+                if ($case->getName() === $targetCase->getName()) {
+                    continue;
+                }
+                if (in_array($case->getName(), $finalNames, true)) {
+                    continue;
+                }
+                $result[] = $enumClass::from($case->getBackingValue());
+            }
+            return $result;
+        }
+
+        if (! is_array($from)) {
+            throw new InvalidArgumentException(
+                "TransitionFrom::\$from on [{$enumClass}::{$targetCase->getName()}] must be '*' or an array of enum cases."
+            );
+        }
+
+        $result = [];
+        foreach ($from as $item) {
+            if (! $item instanceof BackedEnum || $item::class !== $enumClass) {
+                throw new InvalidArgumentException(
+                    "TransitionFrom::\$from on [{$enumClass}::{$targetCase->getName()}] must contain only instances of [{$enumClass}]."
+                );
+            }
+            $result[] = $item;
+        }
+        return $result;
+    }
+
+    /**
      * Get the list of final state case names for an enum.
      *
      * @param class-string<BackedEnum> $enumClass
+     * @throws ReflectionException
      */
     public static function getFinalStates(string $enumClass): array
     {
@@ -199,6 +296,7 @@ class StateMachineManager
      * Find all Transition attributes that allow from -> to.
      *
      * @return Transition[]
+     * @throws ReflectionException
      */
     protected static function findTransitions(BackedEnum $from, BackedEnum $to): array
     {
@@ -221,29 +319,47 @@ class StateMachineManager
     }
 
     /**
-     * Find the first Transition whose guard (if any) passes.
-     * Returns null if no matching transition exists or all guards block.
+     * Find the first Transition whose guards (if any) all pass.
+     *
+     * Guards on a single transition are AND-combined: every guard must
+     * return true. A single false short-circuits the transition. Multiple
+     * matching Transition attributes still provide OR semantics across
+     * attributes (the first transition whose guard chain fully passes wins).
+     *
+     * Returns null if no matching transition exists or every matching
+     * transition was blocked by at least one of its guards.
+     * @throws ReflectionException|BindingResolutionException
      */
     protected static function findAllowedTransition(BackedEnum $from, BackedEnum $to, Model $model, array $metadata = [], array &$checkedGuards = []): ?Transition
     {
         $transitions = static::findTransitions($from, $to);
 
         foreach ($transitions as $transition) {
-            if ($transition->guard === null) {
+            $guards = static::normaliseGuards($transition->guard);
+
+            if ($guards === []) {
                 return $transition;
             }
 
-            $guard = app()->make($transition->guard);
+            $allPassed = true;
+            foreach ($guards as $guardClass) {
+                $guard = app()->make($guardClass);
 
-            if (! $guard instanceof TransitionGuard) {
-                throw new InvalidArgumentException(
-                    "Guard [{$transition->guard}] must implement " . TransitionGuard::class . '.'
-                );
+                if (! $guard instanceof TransitionGuard) {
+                    throw new InvalidArgumentException(
+                        "Guard [{$guardClass}] must implement " . TransitionGuard::class . '.'
+                    );
+                }
+
+                $checkedGuards[] = $guardClass;
+
+                if (! $guard->allow($model, $metadata)) {
+                    $allPassed = false;
+                    break;
+                }
             }
 
-            $checkedGuards[] = $transition->guard;
-
-            if ($guard->allow($model, $metadata)) {
+            if ($allPassed) {
                 return $transition;
             }
         }
@@ -252,10 +368,24 @@ class StateMachineManager
     }
 
     /**
+     * @return array<int, string>
+     */
+    protected static function normaliseGuards(string|array|null $guard): array
+    {
+        if ($guard === null) {
+            return [];
+        }
+
+        return is_array($guard) ? array_values($guard) : [$guard];
+    }
+
+    /**
      * Execute a state transition on a model.
      *
      * @throws FinalStateException
      * @throws InvalidTransitionException
+     * @throws ReflectionException
+     * @throws BindingResolutionException
      */
     public static function transition(Model $model, string $field, BackedEnum $to, array $metadata = []): void
     {

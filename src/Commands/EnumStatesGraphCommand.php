@@ -128,7 +128,8 @@ class EnumStatesGraphCommand extends Command
         $parts = [];
 
         if ($transition->guard !== null) {
-            $parts[] = 'guard: ' . class_basename($transition->guard);
+            $guards = is_array($transition->guard) ? $transition->guard : [$transition->guard];
+            $parts[] = 'guard: ' . implode('+', array_map('class_basename', $guards));
         }
 
         if ($transition->before !== null) {
