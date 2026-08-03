@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         php: ['8.2', '8.3', '8.4']
-        laravel: [10, 11, 12]
+        laravel: [10, 11, 12, 13]
         include:
           # A floating ^8.0 lets composer settle on testbench 8.0.0 / Laravel 10.0.0;
           # the minor floor keeps this job on the current 10.x line.
@@ -24,10 +24,15 @@ jobs:
             testbench: '^9.0'
           - laravel: 12
             testbench: '^10.0'
+          - laravel: 13
+            testbench: '^11.0'
         exclude:
           # Laravel 10 is not supported on PHP 8.4
           - php: '8.4'
             laravel: 10
+          # Laravel 13 requires PHP 8.3+
+          - php: '8.2'
+            laravel: 13
 
     name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }}
 
@@ -42,10 +47,15 @@ jobs:
           extensions: pdo, sqlite3, pdo_sqlite
           coverage: none
 
+      # Composer 2.10 refuses by default to install packages with open security
+      # advisories. Laravel 10 and 11 are EOL and every released version carries
+      # three unfixable ones, so the resolver rejects them outright. The flag only
+      # affects what CI is allowed to install; Laravel 12 and 13 resolve to
+      # patched versions and are unaffected by it.
       - name: Install dependencies
         run: |
           composer require --dev "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
-          composer update --prefer-dist --no-interaction --no-progress
+          composer update --prefer-dist --no-interaction --no-progress --no-security-blocking
 
       # Informational only: composer show takes one package name, a second
       # argument is parsed as a version constraint. Never fail the job on it.

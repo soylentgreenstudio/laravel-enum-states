@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/soylentgreenstudio/laravel-enum-states/actions/workflows/tests.yml/badge.svg)](https://github.com/soylentgreenstudio/laravel-enum-states/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
-[![Laravel](https://img.shields.io/badge/Laravel-10.x--12.x-red.svg)](https://laravel.com)
+[![Laravel](https://img.shields.io/badge/Laravel-10.x--13.x-red.svg)](https://laravel.com)
 [![PHP](https://img.shields.io/badge/PHP-8.2%2B-purple.svg)](https://www.php.net)
 
 **A state machine library for Laravel using native PHP Backed Enums as the single source of truth.**
@@ -114,8 +114,14 @@ $order->stateHistory('status');
 
 ### Requirements
 
-- PHP 8.2+
-- Laravel 10.x — 12.x
+- PHP 8.2+ (PHP 8.3+ for Laravel 13)
+- Laravel 10.x — 13.x
+
+> **Laravel 10 and 11 are end-of-life.** Every released version carries security
+> advisories that will never be patched, and Composer 2.10+ refuses to install
+> them by default. The package still declares support for them, but a fresh
+> install on those versions requires overriding Composer's advisory policy.
+> Laravel 12 and 13 install normally.
 
 ### Install
 
