@@ -96,6 +96,16 @@ class PlainOrder extends Model
     protected $casts = ['status' => 'string'];
 }
 
+// Backed by a table whose status column is nullable from the start
+class NullableOrder extends Model
+{
+    use HasStateMachines;
+
+    protected $table = 'nullable_orders';
+    protected $guarded = [];
+    protected $casts = ['status' => TestOrderStatus::class];
+}
+
 // ---- 5. Multiple #[Transition] on same case with different guards ----
 
 it('allows transition when first guard blocks but second guard passes', function () {
@@ -198,18 +208,21 @@ it('throws when enum is used on multiple fields and field is not specified', fun
 // ---- Extra: null state field ----
 
 it('throws when state field is null', function () {
-    // Create a nullable status column to test null handling
-    Schema::table('orders', function (Blueprint $table) {
-        $table->string('status')->nullable()->default(null)->change();
+    // A dedicated table with a nullable column, rather than ->change() on the
+    // existing one: altering a column needs doctrine/dbal on Laravel 10.
+    Schema::create('nullable_orders', function (Blueprint $table) {
+        $table->id();
+        $table->string('status')->nullable();
+        $table->timestamps();
     });
 
     // Insert with null status bypassing the creating hook
-    DB::table('orders')->insert([
+    DB::table('nullable_orders')->insert([
         'status' => null,
         'created_at' => now(),
         'updated_at' => now(),
     ]);
-    $order = TestOrder::find(DB::getPdo()->lastInsertId());
+    $order = NullableOrder::find(DB::getPdo()->lastInsertId());
 
     $order->transitionTo('status', TestOrderStatus::Processing);
 })->throws(RuntimeException::class, 'not a valid enum state');

@@ -3,9 +3,9 @@
 [![Tests](https://github.com/soylentgreenstudio/laravel-enum-states/actions/workflows/tests.yml/badge.svg)](https://github.com/soylentgreenstudio/laravel-enum-states/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 [![Laravel](https://img.shields.io/badge/Laravel-10.x--12.x-red.svg)](https://laravel.com)
-[![PHP](https://img.shields.io/badge/PHP-8.1%2B-purple.svg)](https://www.php.net)
+[![PHP](https://img.shields.io/badge/PHP-8.2%2B-purple.svg)](https://www.php.net)
 
-**A state machine library for Laravel using native PHP 8.1 Backed Enums as the single source of truth.**
+**A state machine library for Laravel using native PHP Backed Enums as the single source of truth.**
 
 Declare states, transitions, guards, and hooks via PHP Attributes directly on your Enum — no separate state classes, no boilerplate.
 
@@ -114,7 +114,7 @@ $order->stateHistory('status');
 
 ### Requirements
 
-- PHP 8.1+
+- PHP 8.2+
 - Laravel 10.x — 12.x
 
 ### Install
@@ -224,7 +224,7 @@ The history table (default name `state_transitions`, override via `config('enum-
 
 ## Enum Definition
 
-Define your states as a PHP 8.1 Backed Enum. Use attributes to declare the state machine behavior:
+Define your states as a PHP Backed Enum. Use attributes to declare the state machine behavior:
 
 ```php
 use SoylentGreenStudio\EnumStates\Attributes\InitialState;
@@ -857,7 +857,7 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 | **History** | Via separate package or custom | Built-in, configurable table name |
 | **Multiple fields** | Supported, requires explicit config | Supported, auto-detected from `$casts` |
 | **Boilerplate** | 1 class per state + 1 class per transition | 1 enum + attributes only |
-| **PHP version** | PHP 8.0+ | PHP 8.1+ (requires Backed Enums) |
+| **PHP version** | PHP 8.0+ | PHP 8.2+ (requires Backed Enums) |
 
 **Advantages of laravel-enum-states:**
 - Zero boilerplate — no separate state/transition classes
@@ -868,7 +868,7 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 - Guards and hooks resolved via service container
 
 **Disadvantages compared to spatie:**
-- Requires PHP 8.1+ (Backed Enums)
+- Requires PHP 8.2+ (Backed Enums)
 - No custom transition logic classes — hooks are simpler but less flexible
 - Smaller community and ecosystem
 - No default state configuration on the model
