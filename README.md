@@ -118,10 +118,12 @@ $order->stateHistory('status');
 - Laravel 10.x — 13.x
 
 > **Laravel 10 and 11 are end-of-life.** Every released version carries security
-> advisories that will never be patched, and Composer 2.10+ refuses to install
-> them by default. The package still declares support for them, but a fresh
-> install on those versions requires overriding Composer's advisory policy.
-> Laravel 12 and 13 install normally.
+> advisories that will never be patched, so Composer 2.10+ refuses to resolve
+> them by default. Adding this package to an existing Laravel 10 or 11 project
+> still works — Composer leaves already-locked packages alone. What no longer
+> works without overriding that policy is creating a new Laravel 10/11 project,
+> or running a full `composer update` in an existing one, and neither has
+> anything to do with this package. Laravel 12 and 13 are unaffected.
 
 ### Install
 
