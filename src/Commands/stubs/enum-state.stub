@@ -9,10 +9,10 @@ use SoylentGreenStudio\EnumStates\Attributes\Transition;
 enum {{ class }}: string
 {
     #[InitialState]
-    #[Transition(to: [self::Completed, self::Cancelled])]
+    #[Transition(to: [self::InProgress, self::Cancelled])]
     case Pending = 'pending';
 
-    #[Transition(to: [self::Completed])]
+    #[Transition(to: [self::Completed, self::Cancelled])]
     case InProgress = 'in_progress';
 
     #[FinalState]

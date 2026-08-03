@@ -9,6 +9,6 @@ class {{ class }} implements TransitionGuard
 {
     public function allow(Model $model, array $metadata): bool
     {
-        //
+        return true;
     }
 }

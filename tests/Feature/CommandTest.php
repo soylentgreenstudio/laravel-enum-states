@@ -5,7 +5,10 @@ declare(strict_types=1);
 use SoylentGreenStudio\EnumStates\Attributes\InitialState;
 use SoylentGreenStudio\EnumStates\Attributes\FinalState;
 use SoylentGreenStudio\EnumStates\Attributes\Transition;
+use SoylentGreenStudio\EnumStates\Contracts\TransitionGuard;
+use SoylentGreenStudio\EnumStates\StateMachineManager;
 use SoylentGreenStudio\EnumStates\Tests\Support\TestOrderStatus;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Artisan;
 
 // ---- Test-local enum with guards and hooks for annotation testing ----
@@ -115,4 +118,56 @@ it('generates a transition guard file', function () {
     // Cleanup
     @unlink($path);
     @rmdir(app_path('Guards'));
+});
+
+it('generates a guard that is actually runnable', function () {
+    $this->artisan('make:transition-guard', ['name' => 'RunnableGuard'])
+        ->assertSuccessful();
+
+    $path = app_path('Guards/RunnableGuard.php');
+    require $path;
+
+    $guard = new App\Guards\RunnableGuard();
+    $model = new class extends Model {};
+
+    // A stub whose body is just a comment satisfies the string assertions above
+    // but fatals here on the declared bool return type.
+    expect($guard)->toBeInstanceOf(TransitionGuard::class)
+        ->and($guard->allow($model, []))->toBeBool();
+
+    @unlink($path);
+    @rmdir(app_path('Guards'));
+});
+
+it('generates an enum whose states are all reachable', function () {
+    $this->artisan('make:enum-state', ['name' => 'ReachableStatus'])
+        ->assertSuccessful();
+
+    $path = app_path('Enums/ReachableStatus.php');
+    require $path;
+
+    $enumClass = App\Enums\ReachableStatus::class;
+
+    $targets = [];
+    foreach (StateMachineManager::getTransitions($enumClass) as $caseTransitions) {
+        foreach ($caseTransitions as $transition) {
+            foreach ($transition->to as $target) {
+                $targets[$target->name] = true;
+            }
+        }
+    }
+
+    $initial = StateMachineManager::getInitialState($enumClass);
+
+    foreach ($enumClass::cases() as $case) {
+        if ($case->name === $initial?->name) {
+            continue;
+        }
+
+        expect(isset($targets[$case->name]))
+            ->toBeTrue("generated state {$case->name} is unreachable");
+    }
+
+    @unlink($path);
+    @rmdir(app_path('Enums'));
 });
