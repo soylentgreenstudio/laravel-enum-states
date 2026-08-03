@@ -36,6 +36,9 @@
             ]
         }
     },
+    "scripts": {
+        "test": "pest"
+    },
     "config": {
         "sort-packages": true,
         "allow-plugins": {

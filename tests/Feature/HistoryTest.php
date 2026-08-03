@@ -9,6 +9,7 @@ use SoylentGreenStudio\EnumStates\Tests\Support\Factories\HistoryOrderFactory;
 use SoylentGreenStudio\EnumStates\Traits\HasStateMachines;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
 
 // ---- Multi-field enum and model ----
 
@@ -104,6 +105,39 @@ it('supports multiple state machine fields independently', function () {
         ->and($order->fresh()->payment_status)->toBe(HistoryPaymentStatus::Paid)
         ->and($order->stateHistory('status'))->toHaveCount(1)
         ->and($order->stateHistory('payment_status'))->toHaveCount(1);
+});
+
+it('exposes history as an eager-loadable relation', function () {
+    $order = HistoryOrder::factory()->create(['status' => 'pending']);
+    $order->transitionTo(HistoryOrderStatus::Processing);
+
+    $loaded = HistoryOrder::with('stateTransitions')->find($order->getKey());
+
+    expect($loaded->relationLoaded('stateTransitions'))->toBeTrue()
+        ->and($loaded->stateTransitions)->toHaveCount(1)
+        ->and($loaded->stateTransitions->first()->to)->toBe('processing');
+});
+
+it('reads eager-loaded history without extra queries', function () {
+    foreach (range(1, 3) as $ignored) {
+        HistoryOrder::factory()
+            ->create(['status' => 'pending', 'payment_status' => 'unpaid'])
+            ->transitionTo(HistoryOrderStatus::Processing);
+    }
+
+    $orders = HistoryOrder::with('stateTransitions')->get();
+
+    $queries = 0;
+    DB::listen(function () use (&$queries) {
+        $queries++;
+    });
+
+    foreach ($orders as $order) {
+        expect($order->stateHistory('status'))->toHaveCount(1)
+            ->and($order->stateHistory('payment_status'))->toHaveCount(0);
+    }
+
+    expect($queries)->toBe(0);
 });
 
 it('records multiple transitions in order', function () {

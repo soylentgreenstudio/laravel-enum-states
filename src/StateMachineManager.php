@@ -293,6 +293,46 @@ class StateMachineManager
     }
 
     /**
+     * List every target state reachable from the given state whose guards currently pass.
+     *
+     * Targets are de-duplicated: each distinct case is guard-checked once, no
+     * matter how many #[Transition]/#[TransitionFrom] attributes point at it.
+     * A final state yields an empty list.
+     *
+     * @return BackedEnum[]
+     * @throws ReflectionException|BindingResolutionException
+     */
+    public static function allowedTargets(BackedEnum $from, Model $model, array $metadata = []): array
+    {
+        $enumClass = $from::class;
+
+        if (in_array($from->name, static::getFinalStates($enumClass), true)) {
+            return [];
+        }
+
+        $checked = [];
+        $allowed = [];
+
+        foreach (static::getTransitions($enumClass)[$from->name] ?? [] as $transition) {
+            foreach ($transition->to as $target) {
+                if (isset($checked[$target->name])) {
+                    continue;
+                }
+
+                $checked[$target->name] = true;
+
+                // findAllowedTransition already applies OR semantics across every
+                // attribute pointing at this target, so one call settles the case.
+                if (static::findAllowedTransition($from, $target, $model, $metadata) !== null) {
+                    $allowed[] = $target;
+                }
+            }
+        }
+
+        return $allowed;
+    }
+
+    /**
      * Find all Transition attributes that allow from -> to.
      *
      * @return Transition[]
@@ -407,21 +447,9 @@ class StateMachineManager
             throw InvalidTransitionException::notAllowed($from, $to, $field);
         }
 
-        // Dispatch async before hook (fire-and-forget, before transaction)
+        // Resolve the transition up front so guards run once (reused under the lock
+        // when the state has not moved in between).
         $preTransition = static::findAllowedTransition($from, $to, $model, $metadata);
-        if ($preTransition !== null && $preTransition->before !== null) {
-            $hook = app()->make($preTransition->before);
-            static::validateHookInterface($hook, $preTransition->before);
-
-            if ($hook instanceof AsyncTransitionHook) {
-                $pending = ProcessTransitionHook::dispatch(
-                    $preTransition->before, $model, $from, $to, $metadata
-                );
-                if ($hook->queue() !== null) {
-                    $pending->onQueue($hook->queue());
-                }
-            }
-        }
 
         // Fire TransitionStarted with the in-memory state
         event(new TransitionStarted($model, $field, $from, $to, $metadata));
@@ -429,9 +457,9 @@ class StateMachineManager
         try {
             /** @var BackedEnum $confirmedFrom */
             $confirmedFrom = null;
-            $pendingAsyncAfterHooks = [];
+            $pendingAsyncHooks = [];
 
-            DB::transaction(function () use ($model, $field, $from, $to, $metadata, $enumClass, $preTransition, &$confirmedFrom, &$pendingAsyncAfterHooks) {
+            DB::transaction(function () use ($model, $field, $from, $to, $metadata, $enumClass, $preTransition, &$confirmedFrom, &$pendingAsyncHooks) {
                 // 1. Re-read the model with a lock to prevent race conditions
                 $fresh = $model->newQuery()->lockForUpdate()->find($model->getKey());
 
@@ -467,13 +495,21 @@ class StateMachineManager
                     throw InvalidTransitionException::guardBlocked($confirmedFrom, $to, $field, implode(', ', $checkedGuards));
                 }
 
-                // 4. Run sync before hook (async already dispatched pre-transaction)
+                // 4. Run before hook — sync inline on the locked instance, async
+                //    collected for post-commit dispatch
                 if ($transition->before !== null) {
                     $hook = app()->make($transition->before);
                     static::validateHookInterface($hook, $transition->before);
 
-                    if ($hook instanceof TransitionHook && ! ($hook instanceof AsyncTransitionHook)) {
-                        $hook->handle($model, $confirmedFrom, $to, $metadata);
+                    if ($hook instanceof AsyncTransitionHook) {
+                        $pendingAsyncHooks[] = [
+                            'hookClass' => $transition->before,
+                            'queue' => $hook->queue(),
+                        ];
+                    } else {
+                        // $fresh holds the lock and is the instance about to be saved,
+                        // so attribute changes made here are persisted with the transition.
+                        $hook->handle($fresh, $confirmedFrom, $to, $metadata);
                     }
                 }
 
@@ -503,18 +539,18 @@ class StateMachineManager
 
                     if ($hook instanceof AsyncTransitionHook) {
                         // Collect for post-commit dispatch
-                        $pendingAsyncAfterHooks[] = [
+                        $pendingAsyncHooks[] = [
                             'hookClass' => $transition->after,
                             'queue' => $hook->queue(),
                         ];
                     } elseif ($hook instanceof TransitionHook) {
-                        $hook->handle($model, $confirmedFrom, $to, $metadata);
+                        $hook->handle($fresh, $confirmedFrom, $to, $metadata);
                     }
                 }
             });
 
-            // 8. Dispatch async after-hooks (only after successful commit)
-            foreach ($pendingAsyncAfterHooks as $asyncHook) {
+            // 8. Dispatch async hooks (only after successful commit, before-hooks first)
+            foreach ($pendingAsyncHooks as $asyncHook) {
                 $pending = ProcessTransitionHook::dispatch(
                     $asyncHook['hookClass'], $model, $confirmedFrom ?? $from, $to, $metadata
                 );

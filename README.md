@@ -1,5 +1,6 @@
 # soylentgreenstudio/laravel-enum-states
 
+[![Tests](https://github.com/soylentgreenstudio/laravel-enum-states/actions/workflows/tests.yml/badge.svg)](https://github.com/soylentgreenstudio/laravel-enum-states/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 [![Laravel](https://img.shields.io/badge/Laravel-10.x--12.x-red.svg)](https://laravel.com)
 [![PHP](https://img.shields.io/badge/PHP-8.1%2B-purple.svg)](https://www.php.net)
@@ -76,6 +77,9 @@ $order->transitionTo(OrderStatus::Shipped, ['tracking' => 'ABC123']);
 // 4. Check if transition is allowed (never throws)
 $order->canTransitionTo(OrderStatus::Cancelled); // bool
 
+// 4b. Or list every state reachable right now, guards applied
+$order->allowedTransitions(); // [OrderStatus::Shipped, OrderStatus::Cancelled]
+
 // 5. Query by state
 Order::whereState('status', OrderStatus::Pending)->get();
 
@@ -90,10 +94,11 @@ $order->stateHistory('status');
 | **Enum-driven** | States and transitions declared via PHP Attributes on Backed Enums |
 | **Zero config** | Trait auto-detects state machine fields from `$casts` — no registration needed |
 | **Reverse / wildcard transitions** | Declare inbound edges on the target state with `#[TransitionFrom(from: '*')]` or an explicit case list |
+| **Available actions** | `allowedTransitions()` returns every state reachable from the current one, with guards applied |
 | **Guards** | Control whether a transition is allowed via `TransitionGuard` contract |
 | **Multiple guards (AND)** | Pass `guard: [GuardA::class, GuardB::class]` — every guard in the array must pass |
 | **Hooks** | Run logic before/after transition via `TransitionHook` contract |
-| **Transition history** | Every transition recorded with metadata in a configurable history table |
+| **Transition history** | Every transition recorded with metadata in a configurable history table, eager-loadable via `stateTransitions` |
 | **Configurable table name** | Override the history table via `config/enum-states.php` or the `ENUM_STATES_TABLE` env var |
 | **Query scopes** | `whereState`, `whereNotState`, `whereStateIn` — filter models by state |
 | **Events** | `TransitionStarted`, `TransitionCompleted`, `TransitionFailed` fired automatically |
@@ -101,7 +106,7 @@ $order->stateHistory('status');
 | **DB transactions** | Transitions wrapped in `DB::transaction()` with pessimistic locking — hooks and state update are atomic |
 | **Initial / Final states** | Mark states with `#[InitialState]` and `#[FinalState]` attributes |
 | **Metadata** | Pass arbitrary data with each transition — stored in history as JSON |
-| **Async hooks** | Dispatch hooks to queues via `AsyncTransitionHook` — fire-and-forget before, post-commit after |
+| **Async hooks** | Dispatch hooks to queues via `AsyncTransitionHook` — queued only after a successful commit |
 | **Artisan commands** | `enum-states:graph`, `make:enum-state`, `make:transition-guard` for visualization and scaffolding |
 | **Container resolution** | Guards and hooks are resolved via Laravel's service container — inject dependencies freely |
 
@@ -177,14 +182,19 @@ $order->transitionTo(OrderStatus::Processing, $metadata)
       ├─ 4. Fire TransitionStarted event
       └─ 5. DB::transaction() with lockForUpdate()
             ├─ Re-read and re-validate under the lock
-            ├─ Run `before` hook (sync)
+            ├─ Run `before` hook (sync; async collected for post-commit)
             ├─ Update model field + save
             ├─ Write record to history table
             └─ Run `after` hook (sync; async collected for post-commit)
-      ├─ 6. Dispatch any async after-hooks (post-commit)
+      ├─ 6. Dispatch any async hooks (post-commit, before-hooks first)
       ├─ 7. Fire TransitionCompleted event
       └─ On exception: Fire TransitionFailed event, re-throw
 ```
+
+Sync hooks receive the freshly-read, locked model instance — the same object that
+gets saved — so attribute changes made in a `before` hook are persisted together
+with the state change. Async hooks are queued only after a successful commit, so a
+rolled-back transition never leaves a job behind.
 
 ### How auto-detection works
 
@@ -329,6 +339,44 @@ Returns `bool`, never throws:
 if ($order->canTransitionTo(OrderStatus::Shipped)) {
     $order->transitionTo(OrderStatus::Shipped);
 }
+```
+
+### Listing available transitions
+
+`allowedTransitions()` returns every state reachable from the current one, with guards
+evaluated. This is what you want when rendering action buttons or exposing available
+actions in an API response:
+
+```php
+$order->allowedTransitions();
+// => [OrderStatus::Processing, OrderStatus::Cancelled]
+```
+
+Each distinct target is guard-checked exactly once, no matter how many
+`#[Transition]` / `#[TransitionFrom]` attributes point at it.
+
+Pass metadata when your guards depend on it — it is forwarded unchanged:
+
+```php
+$order->allowedTransitions(metadata: ['user_id' => auth()->id()]);
+```
+
+On a model with several state machines, name the field:
+
+```php
+$order->allowedTransitions('payment_status');
+```
+
+Omitting the field on a multi-field model throws `InvalidArgumentException` — there is
+no implicit "first field" behaviour. Returns an empty array when the current state is
+`#[FinalState]` or the field holds no valid enum value.
+
+Rendering the available actions in Blade:
+
+```blade
+@foreach ($order->allowedTransitions() as $state)
+    <button name="to" value="{{ $state->value }}">{{ $state->name }}</button>
+@endforeach
 ```
 
 ### Exception handling
@@ -528,6 +576,25 @@ class SendOrderConfirmation implements TransitionHook
 
 Both hooks receive the model, the `$from` and `$to` enum cases, and the metadata array.
 
+### Which model instance a hook receives
+
+Hooks are handed the freshly-read instance that holds the row lock — the same object the
+transition saves. Attribute changes made in a `before` hook are therefore committed
+alongside the state change, with no extra `save()`:
+
+```php
+class StampShippedAt implements TransitionHook
+{
+    public function handle(Model $model, mixed $from, mixed $to, array $metadata): void
+    {
+        $model->shipped_at = now(); // persisted with the transition
+    }
+}
+```
+
+An `after` hook runs once the model is already saved, so changes made there need their
+own `save()` call (still inside the transaction, so they roll back together).
+
 ### Hook with dependency injection
 
 ```php
@@ -556,6 +623,22 @@ $order->stateHistory('status');
 // History for all state machine fields
 $order->stateHistory();
 ```
+
+### Eager loading
+
+History is also exposed as a `morphMany` relation, so it can be eager loaded instead of
+firing one query per model:
+
+```php
+$orders = Order::with('stateTransitions')->get();
+
+foreach ($orders as $order) {
+    $order->stateHistory('status'); // no extra queries — filtered in memory
+}
+```
+
+`stateHistory()` reads from the loaded relation when present and falls back to a query
+otherwise, so existing code keeps working unchanged.
 
 Each `StateTransition` record contains:
 
@@ -713,12 +796,13 @@ case Processing = 'processing';
 
 | Hook type | `TransitionHook` (sync) | `AsyncTransitionHook` (async) |
 |-----------|------------------------|-------------------------------|
-| `before` | Runs inside DB transaction, blocks transition | Fire-and-forget: dispatched to queue, does not block |
-| `after` | Runs inside DB transaction, can roll back | Dispatched after successful commit |
+| `before` | Runs inside DB transaction, blocks transition | Queued after commit, does not block |
+| `after` | Runs inside DB transaction, can roll back | Queued after commit |
 
 - **Sync hooks** continue to work exactly as before (full backward compatibility)
-- **Async before hooks** are dispatched to the queue at the before-hook point but do not block the transition
-- **Async after hooks** are dispatched only after the DB transaction commits successfully
+- **Async hooks never block the transition** — they cannot veto it and cannot roll it back
+- **Async hooks are dispatched only after the DB transaction commits successfully.** A transition that gets rolled back — by a guard re-checked under the lock, a throwing sync hook, or a deleted model — leaves nothing on the queue
+- `before` and `after` only determine dispatch order for async hooks (before-hooks are pushed first); both run outside the transaction, so neither observes the pre-transition state
 - The internal `ProcessTransitionHook` job wraps the async hook execution
 
 ### AsyncTransitionHook contract
@@ -748,11 +832,12 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 | `MultiGuardTest` | AND-combined guard arrays, short-circuit on first false, exception message content, backward compat with single string guard |
 | `WildcardTransitionTest` | `#[TransitionFrom]` wildcard + explicit list, final-state and self-loop exclusion, merged forward/reverse edges, guards on reverse, graph rendering |
 | `ConfigTableTest` | Default table name, config override at construction, migration against default name |
-| `HookTest` | Before/after hook execution order, rollback on hook exception |
-| `HistoryTest` | History recording, metadata storage, multi-field independence |
+| `HookTest` | Before/after hook execution order, rollback on hook exception, before-hook attribute changes persisted |
+| `AllowedTransitionsTest` | `allowedTransitions()` guard filtering, target de-duplication, final states, reverse edges, field resolution |
+| `HistoryTest` | History recording, metadata storage, multi-field independence, eager loading via `stateTransitions` |
 | `ScopeTest` | `whereState`, `whereNotState`, `whereStateIn` |
 | `EventTest` | `TransitionStarted`, `TransitionCompleted`, metadata in events |
-| `AsyncHookTest` | Async hook dispatch, named queues, post-commit dispatch, backward compatibility |
+| `AsyncHookTest` | Async hook dispatch, named queues, post-commit dispatch and ordering, no dispatch on rollback, backward compatibility |
 | `CommandTest` | Graph command (text/mermaid), generator commands, error handling |
 | `EdgeCaseTest` | Multiple `#[Transition]` OR-semantics, duplicate enum on fields, initial+final on same case, plain model |
 | `ValidationTest` | Guards/hooks not implementing contracts, reflection cache invalidation, descriptive error messages |
@@ -840,8 +925,10 @@ The package uses [Pest](https://pestphp.com/) + [Orchestra Testbench](https://gi
 | `transitionTo($state, $metadata)` | `void` | Transition to a new state |
 | `transitionTo($field, $state, $metadata)` | `void` | Transition with explicit field name |
 | `canTransitionTo($state, $metadata)` | `bool` | Check if transition is allowed |
+| `allowedTransitions($field, $metadata)` | `BackedEnum[]` | States reachable from the current one, guards applied |
 | `stateHistory($field)` | `Collection` | Get transition history for a field |
 | `stateHistory()` | `Collection` | Get transition history for all fields |
+| `stateTransitions()` | `MorphMany` | History relation — eager-loadable with `with()` |
 | `getStateMachineFields()` | `array` | Get detected state machine fields |
 
 ### Query scopes

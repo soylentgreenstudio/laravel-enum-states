@@ -84,6 +84,23 @@ class ThrowingSyncBeforeHook implements TransitionHook
     }
 }
 
+class ThrowingSyncAfterHook implements TransitionHook
+{
+    public function handle(Model $model, mixed $from, mixed $to, array $metadata): void
+    {
+        throw new RuntimeException('Sync after hook failed');
+    }
+}
+
+enum AsyncRollbackStatus: string
+{
+    #[InitialState]
+    #[Transition(to: [self::Done], before: AsyncBeforeHook::class, after: ThrowingSyncAfterHook::class)]
+    case Pending = 'pending';
+
+    case Done = 'done';
+}
+
 enum AsyncHookedStatus: string
 {
     #[InitialState]
@@ -193,6 +210,45 @@ it('does not dispatch async after hook if transaction rolls back', function () {
 
     expect($order->fresh()->status)->toBe(AsyncHookedStatus::Pending);
     expect(StateTransition::count())->toBe(0);
+});
+
+it('does not dispatch async before hook if transaction rolls back', function () {
+    Queue::fake();
+
+    $order = AsyncHookedOrder::factory()->create(['status' => 'pending']);
+    $order->mergeCasts(['status' => AsyncRollbackStatus::class]);
+    $order->status = AsyncRollbackStatus::Pending;
+
+    try {
+        $order->transitionTo(AsyncRollbackStatus::Done);
+    } catch (RuntimeException) {
+        // expected — sync after hook throws, rolling the transaction back
+    }
+
+    // The before hook is queued only once the transition has actually committed,
+    // so a rolled-back transition must leave nothing on the queue.
+    Queue::assertNotPushed(ProcessTransitionHook::class, function (ProcessTransitionHook $job) {
+        return $job->hookClass === AsyncBeforeHook::class;
+    });
+
+    expect($order->fresh()->status->value)->toBe('pending')
+        ->and(StateTransition::count())->toBe(0);
+});
+
+it('dispatches async before hook ahead of async after hook', function () {
+    Queue::fake();
+
+    $order = AsyncHookedOrder::factory()->create(['status' => 'pending']);
+    $order->transitionTo(AsyncHookedStatus::Active);
+
+    $pushed = [];
+    Queue::assertPushed(ProcessTransitionHook::class, function (ProcessTransitionHook $job) use (&$pushed) {
+        $pushed[] = $job->hookClass;
+
+        return true;
+    });
+
+    expect($pushed)->toBe([AsyncBeforeHook::class, AsyncAfterHook::class]);
 });
 
 it('runs sync hooks normally with backward compatibility', function () {

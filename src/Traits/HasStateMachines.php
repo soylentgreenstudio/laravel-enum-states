@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use SoylentGreenStudio\EnumStates\Models\StateTransition;
 use SoylentGreenStudio\EnumStates\StateMachineManager;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Relations\MorphMany;
 use Illuminate\Support\Collection;
 use InvalidArgumentException;
 
@@ -112,18 +113,62 @@ trait HasStateMachines
     }
 
     /**
+     * List the states reachable from the current one, with guards applied.
+     *
+     * Useful for rendering the available actions for a model. Returns an empty
+     * array when the current state is final or the field holds no valid enum.
+     *
+     * @return BackedEnum[]
+     */
+    public function allowedTransitions(?string $field = null, array $metadata = []): array
+    {
+        $field ??= $this->resolveSoleStateMachineField();
+
+        $from = $this->{$field};
+
+        if (! ($from instanceof BackedEnum)) {
+            return [];
+        }
+
+        return StateMachineManager::allowedTargets($from, $this, $metadata);
+    }
+
+    /**
+     * All transition history records for this model, oldest first.
+     *
+     * Exposed as a relation so history can be eager loaded:
+     * Order::with('stateTransitions')->get().
+     */
+    public function stateTransitions(): MorphMany
+    {
+        return $this->morphMany(StateTransition::class, 'model')
+            ->orderBy('transitioned_at')
+            ->orderBy('id');
+    }
+
+    /**
      * Get transition history for a field, or all fields.
+     *
+     * Reads from the eager-loaded relation when present, so calling this in a
+     * loop over Order::with('stateTransitions')->get() costs no extra queries.
      */
     public function stateHistory(?string $field = null): Collection
     {
-        $query = StateTransition::where('model_type', $this->getMorphClass())
-            ->where('model_id', $this->getKey());
+        if ($this->relationLoaded('stateTransitions')) {
+            $history = $this->getRelation('stateTransitions');
+
+            return $field === null
+                ? $history
+                : $history->where('field', $field)->values();
+        }
+
+        $query = $this->stateTransitions();
 
         if ($field !== null) {
             $query->where('field', $field);
         }
 
-        return $query->orderBy('transitioned_at')->orderBy('id')->get();
+        return $query->get();
     }
 
     /**
@@ -150,6 +195,29 @@ trait HasStateMachines
         $values = array_map(fn (BackedEnum $s) => $s->value, $states);
 
         return $query->whereIn($field, $values);
+    }
+
+    /**
+     * Resolve the field to act on when the caller did not name one.
+     */
+    protected function resolveSoleStateMachineField(): string
+    {
+        $fields = $this->getStateMachineFields();
+
+        if (count($fields) === 0) {
+            throw new InvalidArgumentException(
+                'Model [' . static::class . '] has no state machine fields.'
+            );
+        }
+
+        if (count($fields) > 1) {
+            throw new InvalidArgumentException(
+                'Model [' . static::class . '] has multiple state machine fields ['
+                . implode(', ', array_keys($fields)) . ']. Specify the field name explicitly.'
+            );
+        }
+
+        return array_key_first($fields);
     }
 
     /**

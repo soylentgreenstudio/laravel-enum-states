@@ -60,6 +60,23 @@ class ThrowingHook implements TransitionHook
     }
 }
 
+class MutatingBeforeHook implements TransitionHook
+{
+    public function handle(Model $model, mixed $from, mixed $to, array $metadata): void
+    {
+        $model->payment_status = 'touched-by-hook';
+    }
+}
+
+enum MutatingHookStatus: string
+{
+    #[InitialState]
+    #[Transition(to: [self::Active], before: MutatingBeforeHook::class)]
+    case Pending = 'pending';
+
+    case Active = 'active';
+}
+
 /**
  * @method static HookedOrderFactory factory($count = null, $state = [])
  */
@@ -106,6 +123,19 @@ it('rolls back transition when before hook throws', function () {
 
     expect($order->fresh()->status)->toBe(HookedStatus::Pending)
         ->and(StateTransition::count())->toBe(0);
+});
+
+it('persists attribute changes made by a before hook', function () {
+    $order = HookedOrder::factory()->create(['status' => 'pending', 'payment_status' => 'unpaid']);
+    $order->mergeCasts(['status' => MutatingHookStatus::class]);
+    $order->status = MutatingHookStatus::Pending;
+
+    $order->transitionTo(MutatingHookStatus::Active);
+
+    // The hook receives the locked instance that is about to be saved,
+    // so its changes are committed together with the state change.
+    expect($order->fresh()->payment_status)->toBe('touched-by-hook')
+        ->and($order->fresh()->status)->toBe(MutatingHookStatus::Active);
 });
 
 it('fires TransitionFailed event when hook throws', function () {
