@@ -47,8 +47,11 @@ jobs:
           composer require --dev "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
           composer update --prefer-dist --no-interaction --no-progress
 
+      # Informational only: composer show takes one package name, a second
+      # argument is parsed as a version constraint. Never fail the job on it.
       - name: Show resolved versions
-        run: composer show laravel/framework orchestra/testbench | grep -E "^(name|versions)"
+        continue-on-error: true
+        run: composer show | grep -E "^(laravel/framework|orchestra/testbench) "
 
       - name: Run tests
         run: composer test
